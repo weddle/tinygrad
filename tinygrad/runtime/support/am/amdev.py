@@ -3,11 +3,14 @@ import ctypes, collections, dataclasses, functools, hashlib, array
 from tinygrad.helpers import mv_address, getenv, DEBUG, fetch, lo32, hi32
 from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.autogen.am import am
-# v10_structs (v10_compute_mqd etc.) lives in a separate autogen module because the bundled v11/v12 headers
-# don't carry it; load it lazily and attach the v10 MQD struct to the `am` namespace so the existing
-# `getattr(am, f"struct_v{ver}_compute_mqd")` lookup in setup_ring just works on RDNA2.
+# struct_v10_compute_mqd is hand-coded in v10_extra.py because the clang2py autogen pipeline produces
+# empty struct stubs (SIZE=0, no _real_fields_) for v10_structs.h when invoked post-install — the
+# install-time generation of am.py works but our regen consistently produces broken output regardless
+# of how the autogen case is set up. Rather than chase the toolchain non-determinism, we mirror the
+# clang2py format by hand. Attach to the `am` namespace so the existing
+# `getattr(am, f"struct_v{ver}_compute_mqd")` lookup in setup_ring works uniformly for RDNA2.
 if not hasattr(am, 'struct_v10_compute_mqd'):
-  from tinygrad.runtime.autogen.am import v10_structs as _v10
+  from tinygrad.runtime.autogen.am import v10_extra as _v10
   am.struct_v10_compute_mqd = _v10.struct_v10_compute_mqd
 from tinygrad.runtime.support.amd import AMDReg, import_module, import_asic_regs
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, AddrSpace
@@ -247,8 +250,25 @@ class AMDev:
     self.init_hw(self.gfx, self.sdma)
     self.pci_dev.write_config(pci.PCI_COMMAND, self.pci_dev.read_config(pci.PCI_COMMAND, 2) | pci.PCI_COMMAND_MASTER, 2)
 
-    self.smu.set_clocks(level=-1) # last level, max perf.
-    for ip in [self.soc, self.gfx]: ip.set_clockgating_state()
+    # set_clocks queries the DPM frequency table via PPSMC_MSG_GetDpmFreqByIndex and forces min/max
+    # clocks to the highest level. This is a performance optimization, not a correctness requirement —
+    # the GPU runs kernels fine at default clocks. On RDNA2 (Sienna Cichlid, MP1 11.0.7) the SMU message
+    # IDs in our smu_v11_0_7 autogen don't match what the firmware expects (GetDpmFreqByIndex returns
+    # 0xFF "unknown message"), so we currently skip this on a query failure rather than blocking init.
+    # See tiny-egpu task #8 for the proper fix (likely a different ppsmc.h or sibling autogen module).
+    try: self.smu.set_clocks(level=-1) # last level, max perf.
+    except TimeoutError as e:
+      if DEBUG >= 2: print(f"am {self.devfmt}: skipping set_clocks(level=-1), running at default clocks ({e})")
+    # set_clockgating_state is power management policy (RLC safe mode + CGCG/CGLS clock gating
+    # + perfmon overrides). None of it affects kernel execution correctness; it's pure perf/power
+    # tuning. On RDNA2 (Sienna Cichlid) the RLC_SAFE_MODE write doesn't ack — bit 0 stays at 1,
+    # which probably means either RLC's safe-mode handshake works differently here or our field
+    # encoding is wrong for the v10 RLC. Skipping on failure rather than blocking init; the GPU
+    # runs at default clock-gating settings. Proper fix is the same shape as the set_clocks one.
+    for ip in [self.soc, self.gfx]:
+      try: ip.set_clockgating_state()
+      except TimeoutError as e:
+        if DEBUG >= 2: print(f"am {self.devfmt}: skipping {ip.__class__.__name__}.set_clockgating_state ({e})")
     self.reg("regSCRATCH_REG7").write(AMDev.Version)
     self.reg("regSCRATCH_REG6").write(1) # set initialized state.
     if DEBUG >= 2: print(f"am {self.devfmt}: boot done")

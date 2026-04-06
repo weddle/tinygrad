@@ -536,7 +536,16 @@ class AM_SDMA(AM_IP):
     if self.adev.ip_ver[am.SDMA0_HWIP] >= (5,0,0) and idx > 0: raise RuntimeError(f"am {self.adev.devfmt}: sdma queue {idx} is not available")
 
     pipe, queue = idx // 4, idx % 4
-    reg, inst = ("regSDMA_GFX", pipe+queue*4) if self.adev.ip_ver[am.SDMA0_HWIP][:2] == (4,4) else (f"regSDMA{pipe}_QUEUE{queue}", 0)
+    if self.adev.ip_ver[am.SDMA0_HWIP][:2] == (4,4):
+      reg, inst = ("regSDMA_GFX", pipe+queue*4)
+    elif self.adev.ip_ver[am.SDMA0_HWIP][0] == 5:
+      # RDNA2 (sdma_v5_2 on Sienna Cichlid): per-queue-TYPE register naming. SDMA{pipe}_GFX_* is
+      # the graphics queue, used for general SDMA work. RDNA3+ unified everything into
+      # SDMA{pipe}_QUEUE{queue}_*. The idx>0 guard above already restricts us to a single queue
+      # per engine on SDMA 5.x, so we only need the GFX form here.
+      reg, inst = (f"regSDMA{pipe}_GFX", 0)
+    else:
+      reg, inst = (f"regSDMA{pipe}_QUEUE{queue}", 0)
     doorbell = am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 + (pipe+queue*4) * 0xA
     self.sdma_reginst.append((reg, inst))
 
@@ -549,7 +558,10 @@ class AM_SDMA(AM_IP):
     self.adev.reg(f"{reg}_DOORBELL_OFFSET").update(offset=doorbell * 2, inst=inst)
     self.adev.reg(f"{reg}_DOORBELL").update(enable=1, inst=inst)
     self.adev.reg(f"{reg}_MINOR_PTR_UPDATE").write(0x0, inst=inst)
-    self.adev.reg(f"{reg}_RB_CNTL").write(**({f'{self.sdma_name.lower()}_wptr_poll_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP][:2]!=(4,4) else {}),
+    # WPTR_POLL_ENABLE was added in RDNA3+ (SDMA 6.x). RDNA2 SDMA v5.2's regSDMA0_GFX_RB_CNTL has no
+    # such field — only RB_ENABLE, RB_SIZE, RB_VMID, RPTR_WRITEBACK_*, RB_PRIV, RPTR_WB_IDLE.
+    needs_wptr_poll = self.adev.ip_ver[am.SDMA0_HWIP][:2] != (4,4) and self.adev.ip_ver[am.SDMA0_HWIP][0] >= 6
+    self.adev.reg(f"{reg}_RB_CNTL").write(**({f'{self.sdma_name.lower()}_wptr_poll_enable':1} if needs_wptr_poll else {}),
       rb_vmid=0, rptr_writeback_enable=1, rptr_writeback_timer=4, rb_enable=1, rb_priv=1, rb_size=(ring_size//4).bit_length()-1, inst=inst)
     self.adev.reg(f"{reg}_IB_CNTL").update(ib_enable=1, inst=inst)
     return doorbell
