@@ -609,7 +609,18 @@ class AM_PSP(AM_IP):
 
   def is_sos_alive(self): return self.adev.reg(f"{self.reg_pref}_81").read() != 0x0
 
-  def _wait_for_bootloader(self): wait_cond(lambda: self.adev.reg(f"{self.reg_pref}_35").read() & 0x80000000, value=0x80000000, msg="BL not ready")
+  def _wait_for_bootloader(self):
+    # PSP bootloader handshake: poll C2PMSG_35 bit 31 for ready. On timeout, also read C2PMSG_39 (the
+    # bootloader post-code register) so the failure carries diagnostic context instead of just being
+    # a bare timeout. Credit: @m0dm0d on X discovered C2PMSG_39 by reverse-engineering AMDRadeonX6000.kext
+    # from an old iMac (queryBootLoaderPostCode); see tiny-egpu/docs/m0dm0d-rdna2-timeline.md for the
+    # cross-reference and rationale for adopting it here.
+    try:
+      wait_cond(lambda: self.adev.reg(f"{self.reg_pref}_35").read() & 0x80000000, value=0x80000000, msg="BL not ready")
+    except TimeoutError as e:
+      try: post_code = f"0x{self.adev.reg(f'{self.reg_pref}_39').read():08x}"
+      except (KeyError, AttributeError): post_code = "<unavailable>"
+      raise TimeoutError(f"{e} (C2PMSG_39 post-code={post_code})") from e
 
   def _prep_msg1(self, data:memoryview):
     assert len(data) <= self.msg1_view.nbytes, f"msg1 buffer is too small {len(data):#x} > {self.msg1_view.nbytes:#x}"
