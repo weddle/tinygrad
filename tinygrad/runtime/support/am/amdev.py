@@ -22,20 +22,67 @@ class AMRegister(AMDReg):
   def update(self, inst=0, **kwargs): self.write(self.read(inst=inst) & ~self.fields_mask(*kwargs.keys()), inst=inst, **kwargs)
 
 class AMFirmware:
+  # RDNA2 firmware uses codenames instead of version-based filenames
+  FW_CODENAMES = {
+    (11, 0, 7):  "sienna_cichlid",   # Navi 21 (RX 6800/6800 XT/6900 XT)
+    (11, 0, 11): "navy_flounder",     # Navi 22 (RX 6700 XT)
+    (11, 0, 12): "dimgrey_cavefish",  # Navi 23 (RX 6600 XT)
+    (11, 0, 13): "beige_goby",        # Navi 24 (RX 6500 XT)
+  }
+  # Maps version-based firmware names to codename-based names for RDNA2
+  FW_NAME_MAP = {}  # populated in __init__
+
   def __init__(self, adev):
     self.adev = adev
+    mp0_ver = adev.ip_ver.get(am.MP0_HWIP, (0,0,0))
+    codename = self.FW_CODENAMES.get(mp0_ver)
+
     def fmt_ver(hwip): return '_'.join(map(str, adev.ip_ver[hwip]))
+
+    if codename:
+      # Build the name mapping: version-based → codename-based
+      self.FW_NAME_MAP = {
+        f"psp_{fmt_ver(am.MP0_HWIP)}_sos.bin": f"{codename}_sos.bin",
+        f"smu_{fmt_ver(am.MP1_HWIP)}.bin": f"{codename}_smc.bin",
+        f"sdma_{fmt_ver(am.SDMA0_HWIP)}.bin": f"{codename}_sdma.bin",
+        f"gc_{fmt_ver(am.GC_HWIP)}_mec.bin": f"{codename}_mec.bin",
+        f"gc_{fmt_ver(am.GC_HWIP)}_mec2.bin": f"{codename}_mec2.bin",
+        f"gc_{fmt_ver(am.GC_HWIP)}_rlc.bin": f"{codename}_rlc.bin",
+        f"gc_{fmt_ver(am.GC_HWIP)}_pfp.bin": f"{codename}_pfp.bin",
+        f"gc_{fmt_ver(am.GC_HWIP)}_me.bin": f"{codename}_me.bin",
+        f"gc_{fmt_ver(am.GC_HWIP)}_ce.bin": f"{codename}_ce.bin",
+        f"gc_{fmt_ver(am.GC_HWIP)}_imu.bin": f"{codename}_imu.bin",
+      }
 
     # Load SOS firmware
     self.sos_fw = {}
 
     blob, sos_hdr = self.load_fw(f"psp_{fmt_ver(am.MP0_HWIP)}_sos.bin", versioned_header='struct_psp_firmware_header')
-    fw_bin = sos_hdr.psp_fw_bin
 
-    for fw_i in range(sos_hdr.psp_fw_bin_count):
-      fw_bin_desc = am.struct_psp_fw_bin_desc.from_address(ctypes.addressof(fw_bin) + fw_i * ctypes.sizeof(am.struct_psp_fw_bin_desc))
-      ucode_start_offset = fw_bin_desc.offset_bytes + sos_hdr.header.ucode_array_offset_bytes
-      self.sos_fw[fw_bin_desc.fw_type] = blob[ucode_start_offset:ucode_start_offset+fw_bin_desc.size_bytes]
+    if hasattr(sos_hdr, 'psp_fw_bin'):
+      # v2_0 format (RDNA3+): array of fw_bin_desc with explicit fw_type
+      fw_bin = sos_hdr.psp_fw_bin
+      for fw_i in range(sos_hdr.psp_fw_bin_count):
+        fw_bin_desc = am.struct_psp_fw_bin_desc.from_address(ctypes.addressof(fw_bin) + fw_i * ctypes.sizeof(am.struct_psp_fw_bin_desc))
+        ucode_start_offset = fw_bin_desc.offset_bytes + sos_hdr.header.ucode_array_offset_bytes
+        self.sos_fw[fw_bin_desc.fw_type] = blob[ucode_start_offset:ucode_start_offset+fw_bin_desc.size_bytes]
+    else:
+      # v1_3 legacy format (RDNA2): fixed named fields in nested structs
+      base_off = sos_hdr.v1_1.v1_0.header.ucode_array_offset_bytes
+      for fw_type, desc in [
+        (am.PSP_FW_TYPE_PSP_SOS, sos_hdr.v1_1.v1_0.sos),
+        (am.PSP_FW_TYPE_PSP_TOC, sos_hdr.v1_1.toc),
+        (am.PSP_FW_TYPE_PSP_KDB, sos_hdr.v1_1.kdb),
+        (am.PSP_FW_TYPE_PSP_SPL, sos_hdr.spl),
+        (am.PSP_FW_TYPE_PSP_RL, sos_hdr.rl),
+      ]:
+        if desc is not None and desc.size_bytes > 0:
+          self.sos_fw[fw_type] = blob[base_off + desc.offset_bytes:base_off + desc.offset_bytes + desc.size_bytes]
+      # SYS_DRV has no dedicated descriptor in v1_x — by Linux kernel convention (psp_init_sos_base_fw),
+      # SYS_DRV is the leading region of the ucode array up to where SOS begins, i.e. length == sos.offset_bytes.
+      sos_off = sos_hdr.v1_1.v1_0.sos.offset_bytes
+      if sos_off > 0:
+        self.sos_fw[am.PSP_FW_TYPE_PSP_SYS_DRV] = blob[base_off:base_off + sos_off]
 
     # Load other fw
     self.ucode_start: dict[str, int] = {}
@@ -44,9 +91,13 @@ class AMFirmware:
     # SMU firmware
     if adev.ip_ver[am.MP1_HWIP] != (13,0,12):
       blob, hdr = self.load_fw(f"smu_{fmt_ver(am.MP1_HWIP)}.bin", versioned_header="struct_smc_firmware_header")
-      if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0):
-        self.smu_psp_desc = self.desc(blob, hdr.v1_0.header.ucode_array_offset_bytes, hdr.v1_0.header.ucode_size_bytes, am.GFX_FW_TYPE_SMU)
-      else:
+      # The main SMU firmware blob always needs to be loaded via PSP regardless of GC version. Both v1_0 and v2_x
+      # SMC headers expose v1_0.header — v2_0/v2_1 nest v1_0 at offset 0. Without this, SMU stays dark on RDNA2
+      # (the previous code only set smu_psp_desc when GC>=11.0.0, so SMU was never loaded on Navi 21 etc.).
+      v1 = hdr.v1_0 if hasattr(hdr, 'v1_0') else hdr
+      self.smu_psp_desc = self.desc(blob, v1.header.ucode_array_offset_bytes, v1.header.ucode_size_bytes, am.GFX_FW_TYPE_SMU)
+      # RDNA2 (GC < 11.0.0) v2_1 SMC firmware also carries per-state pptables to be loaded as separate descs.
+      if self.adev.ip_ver[am.GC_HWIP] < (11,0,0) and hasattr(hdr, 'pptable_count'):
         p2stables = (am.struct_smc_soft_pptable_entry * hdr.pptable_count).from_buffer(blob[hdr.pptable_entry_offset:])
         for p2stable in p2stables:
           if p2stable.id == (__P2S_TABLE_ID_X:=0x50325358):
@@ -55,8 +106,10 @@ class AMFirmware:
     # SDMA firmware
     blob, hdr = self.load_fw(f"sdma_{fmt_ver(am.SDMA0_HWIP)}.bin", versioned_header="struct_sdma_firmware_header")
     if hdr.header.header_version_major == 1:
-      self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.header.ucode_size_bytes, am.GFX_FW_TYPE_SDMA0,
-                               am.GFX_FW_TYPE_SDMA1, am.GFX_FW_TYPE_SDMA2, am.GFX_FW_TYPE_SDMA3)]
+      # RDNA2 (sdma_v5_2 on Sienna Cichlid) has 2 SDMA engines but PSP only accepts a single SDMA0 load —
+      # the engines share the firmware internally. Loading SDMA1/2/3 with the same blob causes PSP to
+      # reject with status 0xFFFF0006. Restrict to SDMA0 only for v1 sdma headers.
+      self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.header.ucode_size_bytes, am.GFX_FW_TYPE_SDMA0)]
     elif hdr.header.header_version_major == 2:
       self.descs += [self.desc(blob, hdr.ctl_ucode_offset, hdr.ctl_ucode_size_bytes, am.GFX_FW_TYPE_SDMA_UCODE_TH1)]
       self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.ctx_ucode_size_bytes, am.GFX_FW_TYPE_SDMA_UCODE_TH0)]
@@ -68,10 +121,10 @@ class AMFirmware:
 
       ucode_off = hdr.header.ucode_array_offset_bytes
       if hdr.header.header_version_major == 1:
-        # Code
-        self.descs += [self.desc(blob, ucode_off, hdr.header.ucode_size_bytes - hdr.jt_size * 4, getattr(am, f'GFX_FW_TYPE_CP_{fw_name}'))]
-        # JT
-        self.descs += [self.desc(blob, ucode_off + hdr.jt_offset * 4, hdr.jt_size * 4, getattr(am, f'GFX_FW_TYPE_CP_{fw_name}_ME1'))]
+        # Legacy CP firmware (RDNA2 sienna_cichlid_mec.bin etc.): submit the full ucode blob (code + JT inline)
+        # under just the main CP_{fw_name} type. Sienna Cichlid PSP rejects GFX_FW_TYPE_CP_*_ME1 (status 0xFFFF0006)
+        # and the inline JT in the same buffer is sufficient for the engine bringup.
+        self.descs += [self.desc(blob, ucode_off, hdr.header.ucode_size_bytes, getattr(am, f'GFX_FW_TYPE_CP_{fw_name}'))]
       else:
         # Code
         self.descs += [self.desc(blob, ucode_off, hdr.ucode_size_bytes, getattr(am, f'GFX_FW_TYPE_RS64_{fw_name}'))]
@@ -108,6 +161,7 @@ class AMFirmware:
     self.descs += [self.desc(blob, hdr0.header.ucode_array_offset_bytes, hdr0.header.ucode_size_bytes, am.GFX_FW_TYPE_RLC_G)]
 
   def load_fw(self, fname:str, *headers, versioned_header:str|None=None):
+    fname = self.FW_NAME_MAP.get(fname, fname)  # Remap RDNA2 codename firmware
     fpath = fetch(f"https://gitlab.com/kernel-firmware/linux-firmware/-/raw/1e2c15348485939baf1b6d1f5a7a3b799d80703d/amdgpu/{fname}", subdir="fw")
     blob = memoryview(bytearray(fpath.read_bytes()))
     if AM_DEBUG >= 1: print(f"am {self.adev.devfmt}: loading firmware {fname}: {hashlib.sha256(blob).hexdigest()}")
@@ -241,7 +295,29 @@ class AMDev:
   def paddr2xgmi(self, paddr:int) -> int: return self.gmc.paddr_base + paddr
   def xgmi2paddr(self, xgmi_paddr:int) -> int: return xgmi_paddr - self.gmc.paddr_base
 
-  def reg(self, reg:str) -> AMRegister: return self.__dict__[reg]
+  # RDNA3 NBIO uses regBIF_BX0_/regBIF_BX_PF0_ naming. RDNA2 NBIO 2.3 uses bare regBIF_/reg* or regBIF_BX_PF_.
+  _NBIO_RDNA2_ALIASES = (
+    ('regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL', 'regREMAP_HDP_MEM_FLUSH_CNTL'),
+    ('regBIF_BX0_REMAP_HDP_REG_FLUSH_CNTL', 'regREMAP_HDP_REG_FLUSH_CNTL'),
+    ('regBIF_BX0_BIF_DOORBELL_INT_CNTL',    'regBIF_DOORBELL_INT_CNTL'),
+    ('regBIF_BX0_PCIE_INDEX2',              'regPCIE_INDEX2'),
+    ('regBIF_BX0_PCIE_DATA2',               'regPCIE_DATA2'),
+  )
+
+  def reg(self, reg:str) -> AMRegister:
+    if reg in self.__dict__: return self.__dict__[reg]
+    for new, old in self._NBIO_RDNA2_ALIASES:
+      if reg == new and old in self.__dict__: return self.__dict__[old]
+    raise KeyError(reg)
+
+  def __getattr__(self, name:str):
+    if name.startswith('reg'):
+      for new, old in self._NBIO_RDNA2_ALIASES:
+        if name == new and old in self.__dict__: return self.__dict__[old]
+    # Some IP code paths (notably AM_SMU) use direct self.adev.mm* attribute access. Our import_asic_regs
+    # normalized RDNA2's 'mm' prefix to 'reg' at load time, so fall back accordingly.
+    if name.startswith('mm') and (alt:='reg' + name[2:]) in self.__dict__: return self.__dict__[alt]
+    raise AttributeError(name)
 
   def rreg(self, reg:int) -> int:
     val = self.indirect_rreg(reg) if reg >= len(self.mmio) else self.mmio[reg]

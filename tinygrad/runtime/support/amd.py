@@ -97,8 +97,10 @@ def import_asic_regs(prefix:str, version:tuple[int, ...], cls=AMDReg) -> dict[st
       if e.code == 404: continue
       raise
 
-    offsets = {k:v for k,v in offs.items() if _split_name(k)[0] in {'reg', 'mm'} and not k.endswith('_BASE_IDX')}
-    bases = {k[:-len('_BASE_IDX')]:v for k,v in offs.items() if _split_name(k)[0] in {'reg', 'mm'} and k.endswith('_BASE_IDX')}
+    # RDNA2 headers use 'mm' prefix; RDNA3+ use 'reg'. Normalize to 'reg' so downstream code is uniform.
+    def _norm(k): return ('reg' + k[2:]) if _split_name(k)[0] == 'mm' else k
+    offsets = {_norm(k):v for k,v in offs.items() if _split_name(k)[0] in {'reg', 'mm'} and not k.endswith('_BASE_IDX')}
+    bases = {_norm(k[:-len('_BASE_IDX')]):v for k,v in offs.items() if _split_name(k)[0] in {'reg', 'mm'} and k.endswith('_BASE_IDX')}
 
     fields: defaultdict[str, dict[str, tuple[int, int]]] = defaultdict(dict)
     for field_name, field_mask in sh_masks.items():

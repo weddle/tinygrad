@@ -34,7 +34,8 @@ class AM_SOC(AM_IP):
         self.adev.indirect_wreg_pcie(self.adev.regXCC_DOORBELL_FENCE.addr[0], self.adev.regXCC_DOORBELL_FENCE.encode(shub_slv_mode=1), aid=aid)
       self.adev.regBIFC_GFX_INT_MONITOR_MASK.write(0x7ff)
       self.adev.regBIFC_DOORBELL_ACCESS_EN_PF.write(0xfffff)
-    else: self.adev.regRCC_DEV0_EPF2_STRAP2.update(strap_no_soft_reset_dev0_f2=0x0)
+    elif 'regRCC_DEV0_EPF2_STRAP2' in self.adev.__dict__:  # RDNA2 NBIO 2.3 has no EPF2
+      self.adev.regRCC_DEV0_EPF2_STRAP2.update(strap_no_soft_reset_dev0_f2=0x0)
     self.adev.regRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN.write(0x1)
   def set_clockgating_state(self):
     if self.adev.ip_ver[am.HDP_HWIP] >= (5,2,1): self.adev.regHDP_MEM_POWER_CTRL.update(atomic_mem_power_ctrl_en=1, atomic_mem_power_ds_en=1)
@@ -416,7 +417,7 @@ class AM_IH(AM_IP):
     if self.adev.ip_ver[am.OSSSYS_HWIP] != (4,4,2):
       self.adev.regIH_STORM_CLIENT_LIST_CNTL.update(client18_is_storm_client=1)
       self.adev.regIH_INT_FLOOD_CNTL.update(flood_cntl_enable=1)
-      self.adev.regIH_MSI_STORM_CTRL.update(delay=3)
+      if 'regIH_MSI_STORM_CTRL' in self.adev.__dict__: self.adev.regIH_MSI_STORM_CTRL.update(delay=3)  # not present on RDNA2 OSSSYS 5.0.0
 
     # toggle interrupts
     for _, rwptr_vm, suf, ring_id in self.rings:
@@ -566,7 +567,11 @@ class AM_PSP(AM_IP):
     self.tmr_paddr = self.adev.mm.palloc(self.max_tmr_size, align=am.PSP_TMR_ALIGNMENT, zero=False, boot=True) if not self.boot_time_tmr else 0
 
   def init_hw(self):
-    spl_key = am.PSP_FW_TYPE_PSP_SPL if self.adev.ip_ver[am.MP0_HWIP] >= (14,0,0) else am.PSP_FW_TYPE_PSP_KDB
+    # Use the real SPL blob whenever the SOS firmware parser extracted one. On RDNA2 the v1_3 PSP header
+    # parser populates sos_fw[PSP_FW_TYPE_PSP_SPL] from sos_hdr.spl. On RDNA3/4 the v2_0 parser populates
+    # the same key from the explicit fw_type=PSP_SPL entry in psp_fw_bin. Falling back to KDB only matters
+    # for ASICs whose SOS firmware genuinely has no SPL section, which preserves the previous behavior.
+    spl_key = am.PSP_FW_TYPE_PSP_SPL if am.PSP_FW_TYPE_PSP_SPL in self.adev.fw.sos_fw else am.PSP_FW_TYPE_PSP_KDB
     sos_components = [(am.PSP_FW_TYPE_PSP_KDB, am.PSP_BL__LOAD_KEY_DATABASE), (spl_key, am.PSP_BL__LOAD_TOS_SPL_TABLE),
       (am.PSP_FW_TYPE_PSP_SYS_DRV, am.PSP_BL__LOAD_SYSDRV), (am.PSP_FW_TYPE_PSP_SOC_DRV, am.PSP_BL__LOAD_SOCDRV),
       (am.PSP_FW_TYPE_PSP_INTF_DRV, am.PSP_BL__LOAD_INTFDRV), (am.PSP_FW_TYPE_PSP_DBG_DRV, am.PSP_BL__LOAD_DBGDRV),
@@ -586,7 +591,10 @@ class AM_PSP(AM_IP):
     for psp_desc in self.adev.fw.descs: self._load_ip_fw_cmd(*psp_desc)
 
     if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0): self._rlc_autoload_cmd()
-    else: self._load_ip_fw_cmd([am.GFX_FW_TYPE_REG_LIST], self.adev.fw.sos_fw[am.PSP_FW_TYPE_PSP_RL])
+    elif am.PSP_FW_TYPE_PSP_RL in self.adev.fw.sos_fw:
+      # GFX10 (RDNA2) loads REG_LIST from the SOS firmware's RL section. Sienna Cichlid's
+      # sienna_cichlid_sos.bin has rl.size_bytes == 0 — no RL section — so skip the load.
+      self._load_ip_fw_cmd([am.GFX_FW_TYPE_REG_LIST], self.adev.fw.sos_fw[am.PSP_FW_TYPE_PSP_RL])
 
   def is_sos_alive(self): return self.adev.reg(f"{self.reg_pref}_81").read() != 0x0
 
