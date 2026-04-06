@@ -504,6 +504,12 @@ class AM_SDMA(AM_IP):
         self.adev.reg(f"regSDMA{pipe}_UTCL1_PAGE").update(rd_l2_policy=2, wr_l2_policy=3, **({'llc_noalloc':1} if self.sdma_name == "F32" else {}),
                                                           inst=inst)
         self.adev.reg(f"regSDMA{pipe}_{self.sdma_name}_CNTL").update(halt=0, **{f"{'th1_' if self.sdma_name == 'F32' else ''}reset":0}, inst=inst)
+      else:
+        # SDMA < 6.0.0 (RDNA2 sdma_v5_2 etc.) — the F32 microcontroller starts halted after PSP loads
+        # the firmware. Clear the HALT bit so the engine starts running and reads the wptr poll address.
+        # Without this, queue submissions are silently ignored (rb_wptr stays at 0 even after the host
+        # writes the wptr poll memory) and any signal/fence wait times out forever.
+        self.adev.reg(f"regSDMA{pipe}_F32_CNTL").update(halt=0, inst=inst)
 
       self.adev.reg(f"regSDMA{pipe}_CNTL").update(trap_enable=1,
         **({'utc_l1_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP] <= (5,2,0) else {}), inst=inst)

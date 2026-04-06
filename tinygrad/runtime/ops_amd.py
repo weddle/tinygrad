@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import cast
-import os, ctypes, struct, hashlib, functools, importlib, mmap, errno, array, contextlib, sys, weakref, itertools, collections, atexit
+import os, ctypes, struct, hashlib, functools, importlib, mmap, errno, array, contextlib, sys, weakref, itertools, collections, atexit, time
 assert sys.platform != 'win32'
 from dataclasses import dataclass
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, HWQueue, CLikeArgsState, HCQSignal, HCQProgram, FileIOInterface
@@ -46,6 +46,116 @@ class AMDSignal(HCQSignal):
   def _sleep(self, time_spent_since_last_sleep_ms:int):
     # Reasonable to sleep for long workloads (which take more than 200ms) and only timeline signals.
     if time_spent_since_last_sleep_ms > 200 and self.owner is not None: self.owner.iface.sleep(200)
+
+  def wait(self, value:int, timeout:int|None=None):
+    # Diagnostic instrumentation per oracle bisect plan: on timeout, dump HQD state + raw signal so
+    # we can tell which branch of the failure tree we're on (queue not consumed vs consumed but
+    # signal not written vs signal written but host can't see it). See tiny-egpu task #7.
+    try: super().wait(value, timeout)
+    except RuntimeError as e:
+      try: self._dump_diagnostics(value)
+      except Exception as dump_err: print(f"AMDSignal: diagnostic dump failed: {dump_err}")
+      raise
+
+  def _dump_diagnostics(self, expected_value:int):
+    print(f"--- AMDSignal._dump_diagnostics: expected={expected_value} signal.value={self.value} value_addr=0x{self.value_addr:x} ---")
+    if self.owner is None or not hasattr(self.owner, 'iface') or not hasattr(self.owner.iface, 'dev_impl'):
+      print("  (no AM dev_impl available — skipping HQD register dump)")
+      return
+    adev = self.owner.iface.dev_impl
+    # Re-read the signal a few times via the same cpu_view path to detect host-side staleness
+    raw_reads = []
+    for _ in range(4):
+      raw_reads.append(self.base_buf.cpu_view().view(0, 8, 'Q')[0])
+      time.sleep(0.01)
+    print(f"  signal raw cpu_view 4x reads: {raw_reads}")
+    # Dump the host's view of the compute queue: put_value (host counter), write_ptr (what host wrote
+    # to wptr poll memory), read_ptr (what GPU reported as rptr). If write_ptr matches put_value but
+    # GPU's HQD WPTR is still 0, the host did its job and the GPU isn't ingesting. If write_ptr is 0
+    # too, the host's submit path itself is broken.
+    cq = getattr(self.owner, 'compute_queue', None)
+    if cq is not None:
+      try:
+        host_put = cq.put_value
+        host_wptr = cq.write_ptr[0] if cq.write_ptr is not None else None
+        host_rptr = cq.read_ptr[0] if cq.read_ptr is not None else None
+        print(f"  compute_queue: put_value={host_put}  write_ptr[0]={host_wptr}  read_ptr[0]={host_rptr}")
+      except Exception as e:
+        print(f"  compute_queue dump failed: {e}")
+    sq = getattr(self.owner, 'sdma_queue', None)
+    if callable(sq):
+      try:
+        sq0 = sq(0)
+        if sq0 is not None:
+          print(f"  sdma_queue(0): put_value={sq0.put_value}  write_ptr[0]={sq0.write_ptr[0] if sq0.write_ptr else None}  read_ptr[0]={sq0.read_ptr[0] if sq0.read_ptr else None}")
+      except Exception as e:
+        print(f"  sdma_queue(0) dump failed: {e}")
+    # SDMA GPU-side registers — the SDMA queue is where Tensor.ones is actually being submitted.
+    # On RDNA2 (sdma_v5_2 / GC 10.3.0), the relevant registers are SDMA0_GFX_* (per-queue-type naming).
+    print("  --- SDMA0_GFX GPU-side state ---")
+    for r in ['regSDMA0_GFX_RB_RPTR', 'regSDMA0_GFX_RB_WPTR', 'regSDMA0_GFX_RB_BASE', 'regSDMA0_GFX_RB_BASE_HI',
+              'regSDMA0_GFX_RB_CNTL', 'regSDMA0_GFX_IB_CNTL', 'regSDMA0_GFX_DOORBELL', 'regSDMA0_GFX_DOORBELL_OFFSET',
+              'regSDMA0_GFX_RB_RPTR_ADDR_LO', 'regSDMA0_GFX_RB_RPTR_ADDR_HI',
+              'regSDMA0_GFX_RB_WPTR_POLL_ADDR_LO', 'regSDMA0_GFX_RB_WPTR_POLL_ADDR_HI',
+              'regSDMA0_F32_CNTL', 'regSDMA0_STATUS_REG', 'regSDMA0_F32_INTERRUPT_CNTL']:
+      try:
+        if hasattr(adev, r):
+          val = getattr(adev, r).read()
+          print(f"    {r}=0x{val:08x}")
+      except Exception as e:
+        print(f"    {r}: read failed: {e}")
+    # Iterate compute queue slots that AM_GFX uses (me=1, pipe=0, queue=0..1) and dump HQD state
+    for xcc in range(adev.gfx.xccs):
+      for q in range(2):
+        try:
+          adev.gfx._grbm_select(me=1, pipe=0, queue=q, inst=xcc)
+          active = adev.regCP_HQD_ACTIVE.read(inst=xcc)
+          rptr = adev.regCP_HQD_PQ_RPTR.read(inst=xcc) if hasattr(adev, 'regCP_HQD_PQ_RPTR') else -1
+          wptr_lo = adev.regCP_HQD_PQ_WPTR_LO.read(inst=xcc) if hasattr(adev, 'regCP_HQD_PQ_WPTR_LO') else -1
+          wptr_hi = adev.regCP_HQD_PQ_WPTR_HI.read(inst=xcc) if hasattr(adev, 'regCP_HQD_PQ_WPTR_HI') else -1
+          db = adev.regCP_HQD_PQ_DOORBELL_CONTROL.read(inst=xcc) if hasattr(adev, 'regCP_HQD_PQ_DOORBELL_CONTROL') else -1
+          base_lo = adev.regCP_HQD_PQ_BASE.read(inst=xcc) if hasattr(adev, 'regCP_HQD_PQ_BASE') else -1
+          base_hi = adev.regCP_HQD_PQ_BASE_HI.read(inst=xcc) if hasattr(adev, 'regCP_HQD_PQ_BASE_HI') else -1
+          wptr_poll_lo = adev.regCP_HQD_PQ_WPTR_POLL_ADDR.read(inst=xcc) if hasattr(adev, 'regCP_HQD_PQ_WPTR_POLL_ADDR') else -1
+          wptr_poll_hi = adev.regCP_HQD_PQ_WPTR_POLL_ADDR_HI.read(inst=xcc) if hasattr(adev, 'regCP_HQD_PQ_WPTR_POLL_ADDR_HI') else -1
+          rptr_report_lo = adev.regCP_HQD_PQ_RPTR_REPORT_ADDR.read(inst=xcc) if hasattr(adev, 'regCP_HQD_PQ_RPTR_REPORT_ADDR') else -1
+          rptr_report_hi = adev.regCP_HQD_PQ_RPTR_REPORT_ADDR_HI.read(inst=xcc) if hasattr(adev, 'regCP_HQD_PQ_RPTR_REPORT_ADDR_HI') else -1
+          print(f"  HQD xcc={xcc} me=1 pipe=0 queue={q}:")
+          print(f"    ACTIVE=0x{active:08x}  RPTR=0x{rptr:08x}  WPTR_LO=0x{wptr_lo:08x}  WPTR_HI=0x{wptr_hi:08x}")
+          print(f"    DBELL_CTRL=0x{db:08x}")
+          print(f"    PQ_BASE=0x{((base_hi<<32)|base_lo):016x}")
+          print(f"    WPTR_POLL_ADDR=0x{((wptr_poll_hi<<32)|wptr_poll_lo):016x}")
+          print(f"    RPTR_REPORT_ADDR=0x{((rptr_report_hi<<32)|rptr_report_lo):016x}")
+          # Try to translate the wptr_poll_addr (a GPU virt address) to a host pointer via the memory manager,
+          # so we can see what the host actually wrote there. The MM tracks page tables for sysmem allocations.
+          if active == 1 and wptr_poll_lo > 0:
+            wptr_poll_va = (wptr_poll_hi << 32) | wptr_poll_lo
+            try:
+              # Walk the memory manager's allocation tracking — find the buffer containing this VA
+              found = None
+              for buf in getattr(adev.mm, 'tracked_buffers', []):
+                if hasattr(buf, 'va_addr') and buf.va_addr <= wptr_poll_va < buf.va_addr + buf.size:
+                  found = buf
+                  break
+              if found and hasattr(found, 'cpu_view'):
+                offset = wptr_poll_va - found.va_addr
+                wptr_mem = found.cpu_view().view(offset, 8, 'Q')[0]
+                print(f"    wptr_poll memory@0x{wptr_poll_va:x} (cpu view): 0x{wptr_mem:016x}")
+              else:
+                print(f"    wptr_poll memory@0x{wptr_poll_va:x}: no host mapping found via mm.tracked_buffers")
+            except Exception as ex:
+              print(f"    wptr_poll memory read failed: {ex}")
+        except Exception as e:
+          print(f"  HQD xcc={xcc} q={q}: read failed: {e}")
+      try: adev.gfx._grbm_select(inst=xcc)  # restore broadcast
+      except Exception: pass
+    # Dump general CP status
+    try:
+      cp_stat = adev.regCP_STAT.read() if hasattr(adev, 'regCP_STAT') else -1
+      print(f"  CP_STAT=0x{cp_stat:08x}")
+    except Exception as e:
+      print(f"  CP_STAT read failed: {e}")
+    print(f"--- end diagnostics ---")
 
 class AMDComputeQueue(HWQueue):
   def __init__(self, dev:AMDDevice):
