@@ -250,7 +250,8 @@ class AM_GFX(AM_IP):
     self._config_mec()
 
     # NOTE: Golden reg for gfx11. No values for this reg provided. The kernel just ors 0x20000000 to this reg.
-    for xcc in range(self.xccs): self.adev.regTCP_CNTL.write(self.adev.regTCP_CNTL.read() | 0x20000000, inst=xcc)
+    if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0):
+      for xcc in range(self.xccs): self.adev.regTCP_CNTL.write(self.adev.regTCP_CNTL.read() | 0x20000000, inst=xcc)
 
     for xcc in range(self.xccs): self.adev.regRLC_CNTL.write(0x1, inst=xcc)
 
@@ -258,7 +259,9 @@ class AM_GFX(AM_IP):
 
     for xcc in range(self.xccs): self.adev.regRLC_SPM_MC_CNTL.write(0xf, inst=xcc)
 
-    if self.adev.ip_ver[am.NBIO_HWIP][:2] != (7,9):
+    # S2A doorbell routing is an NBIO 4.x+ feature (GFX11+). NBIO 2.x (RDNA2) and NBIO 7.9 (MI300)
+    # do not use this routing — they enable doorbells via the BIF aperture (handled in AM_NBIO.init_hw).
+    if self.adev.ip_ver[am.NBIO_HWIP][:2] != (7,9) and self.adev.ip_ver[am.NBIO_HWIP][0] >= 4:
       self.adev.soc.doorbell_enable(port=0, awid=0x3, awaddr_31_28_value=0x3)
       self.adev.soc.doorbell_enable(port=3, awid=0x6, awaddr_31_28_value=0x3)
 
@@ -362,7 +365,9 @@ class AM_GFX(AM_IP):
 
   def _enable_mec(self):
     for xcc in range(self.xccs):
-      if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0): self.adev.regCP_MEC_RS64_CNTL.update(mec_pipe0_reset=0, mec_pipe0_active=1, mec_halt=0, inst=xcc)
+      # RS64 microcode + the MEC_RS64 register family was introduced in GFX11. RDNA2 / GFX10
+      # uses the legacy MEC microcode and clears the halt bits via regCP_MEC_CNTL.
+      if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0): self.adev.regCP_MEC_RS64_CNTL.update(mec_pipe0_reset=0, mec_pipe0_active=1, mec_halt=0, inst=xcc)
       else: self.adev.regCP_MEC_CNTL.write(0x0, inst=xcc)
     time.sleep(0.05)  # Wait for MEC to be ready
 
@@ -376,12 +381,15 @@ class AM_GFX(AM_IP):
       self.adev.reg(f"regCP_{cntl_reg}_CNTL").update(**{f"{eng_name.lower()}_pipe{pipe}_reset": 0 for pipe in range(pipe_cnt)}, inst=xcc)
 
     for xcc in range(self.adev.gfx.xccs):
-      if self.adev.ip_ver[am.GC_HWIP] < (10,0,0):
+      # Legacy MEC halt path covers everything before RS64 (GFX11+): vega/arcturus AND RDNA2 (GFX10).
+      if self.adev.ip_ver[am.GC_HWIP] < (11,0,0):
         self.adev.regCP_MEC_CNTL.update(mec_invalidate_icache=1, mec_me1_pipe0_reset=1, mec_me2_pipe0_reset=1, mec_me1_halt=1,mec_me2_halt=1,inst=xcc)
       if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0):
         _config_helper(eng_name="PFP", cntl_reg="ME", eng_reg="PFP", pipe_cnt=1, xcc=xcc)
         _config_helper(eng_name="ME", cntl_reg="ME", eng_reg="ME", pipe_cnt=1, xcc=xcc)
-      if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0):
+      # RS64 MEC config (regCP_MEC_RS64_*, ucode_start['MEC']) is GFX11+ only. RDNA2 doesn't program
+      # PRGRM_CNTR_START — the MEC microcode loaded by PSP starts at a fixed address.
+      if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0):
         _config_helper(eng_name="MEC", cntl_reg="MEC_RS64", eng_reg="MEC_RS64", pipe_cnt=1, me=1, xcc=xcc)
 
   def _dequeue_hqds(self):
@@ -507,7 +515,10 @@ class AM_SDMA(AM_IP):
           self.adev.reg(f"regDOORBELL0_CTRL_ENTRY_{entry}").write(**{f"bif_doorbell{entry}_range_size_entry": 20,
             f"bif_doorbell{entry}_range_offset_entry": (am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 + (entry - 1) * 0xA) * 2})
           self.adev.soc.doorbell_enable(port=port, awid=awid, awaddr_31_28_value=awaddr, offset=offset, size=4, aid=aid_id)
-    else: self.adev.soc.doorbell_enable(port=2, awid=0xe, awaddr_31_28_value=0x3, offset=am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0*2, size=4)
+    elif self.adev.ip_ver[am.NBIO_HWIP][0] >= 4:
+      # S2A doorbell routing requires NBIO 4.x+. RDNA2 NBIO 2.x uses the BIF aperture (set up in AM_NBIO.init_hw)
+      # and per-engine SDMA*_DOORBELL registers programmed by setup_ring — no S2A routing needed here.
+      self.adev.soc.doorbell_enable(port=2, awid=0xe, awaddr_31_28_value=0x3, offset=am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0*2, size=4)
 
   def fini_hw(self):
     for reg, inst in self.sdma_reginst:

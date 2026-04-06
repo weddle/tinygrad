@@ -3,6 +3,12 @@ import ctypes, collections, dataclasses, functools, hashlib, array
 from tinygrad.helpers import mv_address, getenv, DEBUG, fetch, lo32, hi32
 from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.autogen.am import am
+# v10_structs (v10_compute_mqd etc.) lives in a separate autogen module because the bundled v11/v12 headers
+# don't carry it; load it lazily and attach the v10 MQD struct to the `am` namespace so the existing
+# `getattr(am, f"struct_v{ver}_compute_mqd")` lookup in setup_ring just works on RDNA2.
+if not hasattr(am, 'struct_v10_compute_mqd'):
+  from tinygrad.runtime.autogen.am import v10_structs as _v10
+  am.struct_v10_compute_mqd = _v10.struct_v10_compute_mqd
 from tinygrad.runtime.support.amd import AMDReg, import_module, import_asic_regs
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, AddrSpace
 from tinygrad.runtime.support.system import PCIDevice
