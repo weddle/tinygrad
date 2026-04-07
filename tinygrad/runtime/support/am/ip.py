@@ -345,7 +345,14 @@ class AM_GFX(AM_IP):
     self.kiq_meta_view = self.adev.pci_dev.map_bar(bar=0, off=_meta_paddr, size=0x1000, fmt='Q')
     self.kiq_rptr_addr = self.kiq_meta_va + 0x00
     self.kiq_wptr_addr = self.kiq_meta_va + 0x08
-    print(f"am {self.adev.devfmt}: KIQ ring va=0x{self.kiq_ring_va:x} paddr=0x{_ring_paddr:x}; meta va=0x{self.kiq_meta_va:x} paddr=0x{_meta_paddr:x}")
+    # Cleaner-shader buffer (Linux gfx10_kiq_set_resources writes cleaner_shader_gpu_addr >> 8 in
+    # dwords 4 and 5 of SET_RESOURCES). Linux allocates a real cleaner shader BO; for RDNA2
+    # bring-up we just allocate a zero-filled 256-byte stub. Use GPUVA (not MC) to match the
+    # convention ring/MQD addresses follow in this driver.
+    _cleaner_mapping = self.adev.mm.valloc(0x100, uncached=True, contiguous=True)
+    self.kiq_cleaner_shader_va = _cleaner_mapping.va_addr
+    print(f"am {self.adev.devfmt}: KIQ ring va=0x{self.kiq_ring_va:x} paddr=0x{_ring_paddr:x}; meta va=0x{self.kiq_meta_va:x} paddr=0x{_meta_paddr:x}; cleaner_shader va=0x{self.kiq_cleaner_shader_va:x}")
+    self.kiq_set_resources_sent = False
 
     # Build the KIQ MQD struct (compute MQD shape, KIQ-specific values)
     struct_t = getattr(am, f"struct_v{self.adev.ip_ver[am.GC_HWIP][0]}_compute_mqd")
@@ -402,31 +409,14 @@ class AM_GFX(AM_IP):
     self._grbm_select(inst=0)
     self.kiq_setup_done = True
     print(f"am {self.adev.devfmt}: KIQ HQD activated (ring va=0x{self.kiq_ring_va:x}, mqd mc=0x{self.kiq_mqd_mc:x}, doorbell idx {self.kiq_doorbell_idx})")
-
-    # Submit a SET_RESOURCES packet to the KIQ as a smoke test that MEC is consuming the KIQ ring.
-    # The queue mask covers all possible compute queues (0xffffffff for the low half).
-    self._kiq_set_resources(0xffffffff)
-    time.sleep(0.1)
-    # Read back KIQ state to see if it consumed the packet
-    self._grbm_select(me=self.kiq_me, pipe=self.kiq_pipe, queue=self.kiq_queue, inst=0)
-    kiq_rptr = self.adev.regCP_HQD_PQ_RPTR.read()
-    kiq_wptr = self.adev.regCP_HQD_PQ_WPTR_LO.read()
-    kiq_active = self.adev.regCP_HQD_ACTIVE.read()
-    self._grbm_select(inst=0)
-    print(f"am {self.adev.devfmt}: KIQ post-SET_RESOURCES: ACTIVE=0x{kiq_active:x} RPTR=0x{kiq_rptr:x} WPTR=0x{kiq_wptr:x} (host_wptr_bytes={self.kiq_host_wptr_dws*4})")
-
-    # AMD_KIQ_DBC_REARM=1: re-arm CP_HQD_PQ_DOORBELL_CONTROL after _kiq_set_resources. On RDNA2
-    # with MEC firmware not actually running, the CP's "failed scheduling" cleanup path clears
-    # DOORBELL_EN and WPTR_LO ~100ms after the first doorbell delivery fails to be consumed.
-    # That clobber drops all subsequent submissions (MAP_QUEUES, test packets) unless the bit
-    # is re-armed. Default-off: this is a diagnostic workaround for the compute-arc investigation
-    # and should not be relied on in production. See tiny-egpu docs/rdna2-investigation-log.md
-    # 2026-04-07 KIQ clobber trace entry for the full characterization.
-    if getenv("AMD_KIQ_DBC_REARM", 0):
-      self._grbm_select(me=self.kiq_me, pipe=self.kiq_pipe, queue=self.kiq_queue, inst=0)
-      self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.write(0x40000000)  # DOORBELL_EN=1, OFFSET=0
-      self._grbm_select(inst=0)
-      print(f"am {self.adev.devfmt}: AMD_KIQ_DBC_REARM=1 re-armed KIQ CP_HQD_PQ_DOORBELL_CONTROL", flush=True)
+    # NOTE: do NOT submit SET_RESOURCES here. Linux amdgpu_gfx_enable_kcq() batches
+    # SET_RESOURCES + MAP_QUEUES into a single KIQ commit with one doorbell ring so MEC sees
+    # both packets at once. Submitting SET_RESOURCES alone (followed by a sleep and separate
+    # MAP_QUEUES) triggers the CP's one-shot "failed scheduling" cleanup path, which clears
+    # CP_HQD_PQ_DOORBELL_CONTROL.DOORBELL_EN and drops all subsequent KIQ submissions. See
+    # tiny-egpu docs/rdna2-investigation-log.md 2026-04-07 doorbell-clobber trace. The first
+    # real SET_RESOURCES happens inside _kiq_enable_kcq(), called from setup_ring() when the
+    # first KCQ MQD is built.
 
   def _kiq_submit_packets(self, dwords):
     """Write PM4 dwords into the KIQ ring buffer and ring the KIQ doorbell.
@@ -452,23 +442,27 @@ class AM_GFX(AM_IP):
     # Ring the KIQ doorbell in BYTES (BAR2 doorbell aperture, 64-bit write at index*8)
     self.adev.doorbell64.view(self.kiq_doorbell_idx * 8, 8, fmt='Q')[0] = wptr_bytes
 
-  def _kiq_set_resources(self, queue_mask):
-    """SET_RESOURCES PM4 packet on the KIQ ring. Linux gfx10_kiq_set_resources, 8 dwords."""
+  def _build_kiq_set_resources(self, queue_mask, cleaner_shader_addr):
+    """Build SET_RESOURCES PM4 packet dwords. Linux gfx10_kiq_set_resources, 8 dwords.
+
+    cleaner_shader_addr is the GPU address (pre-shift); Linux writes it as (addr >> 8).
+    """
     PACKET3_SET_RESOURCES = 0xA0
     header = (3 << 30) | ((PACKET3_SET_RESOURCES & 0xff) << 8) | ((6 & 0x3fff) << 16)
-    dwords = [
+    cs_shifted = (cleaner_shader_addr >> 8) & 0xffffffffffffffff
+    return [
       header,
       (0 << 0) | (0 << 29),  # vmid_mask=0, queue_type=0 (KIQ)
       queue_mask & 0xffffffff,
       (queue_mask >> 32) & 0xffffffff,
-      0, 0,  # cleaner shader addr lo/hi (none)
-      0,     # oac mask
-      0,     # gds heap base/size
+      cs_shifted & 0xffffffff,          # cleaner shader addr lo
+      (cs_shifted >> 32) & 0xffffffff,  # cleaner shader addr hi
+      0,                                 # oac mask
+      0,                                 # gds heap base/size
     ]
-    self._kiq_submit_packets(dwords)
 
-  def _kiq_map_queues(self, ring_me, ring_pipe, ring_queue, doorbell_idx, mqd_addr, wptr_addr):
-    """MAP_QUEUES PM4 packet on the KIQ ring. Linux gfx10_kiq_map_queues, 7 dwords."""
+  def _build_kiq_map_queues(self, ring_me, ring_pipe, ring_queue, doorbell_idx, mqd_addr, wptr_addr):
+    """Build MAP_QUEUES PM4 packet dwords. Linux gfx10_kiq_map_queues, 7 dwords."""
     PACKET3_MAP_QUEUES = 0xA2
     header = (3 << 30) | ((PACKET3_MAP_QUEUES & 0xff) << 8) | ((5 & 0x3fff) << 16)
     me_field = 0 if ring_me == 1 else 1
@@ -481,7 +475,7 @@ class AM_GFX(AM_IP):
             (0 << 24) |    # ALLOC_FORMAT = all_on_one_pipe
             (0 << 26) |    # ENGINE_SEL = compute
             (1 << 29))     # NUM_QUEUES = 1
-    dwords = [
+    return [
       header,
       info,
       doorbell_idx << 2,  # PACKET3_MAP_QUEUES_DOORBELL_OFFSET shift = 2
@@ -490,7 +484,33 @@ class AM_GFX(AM_IP):
       wptr_addr & 0xffffffff,
       (wptr_addr >> 32) & 0xffffffff,
     ]
-    self._kiq_submit_packets(dwords)
+
+  def _kiq_enable_kcq(self, ring_me, ring_pipe, ring_queue, doorbell_idx, mqd_addr, wptr_addr):
+    """Linux amdgpu_gfx_enable_kcq() parity: batch SET_RESOURCES + MAP_QUEUES into one KIQ
+    submission (single ring write + single doorbell ring), so MEC sees both packets without
+    an intermediate scheduling-failure window that triggers the one-shot CP auto-clear of
+    CP_HQD_PQ_DOORBELL_CONTROL.
+
+    queue_mask is computed per amdgpu_queue_mask_bit_to_set_resource_bit():
+      set_resource_bit = mec * 4*8 + pipe * 8 + queue  (mec = ring_me - 1)
+    which for our compute queue at me=1/pipe=0/queue=0 gives bit 0 → queue_mask = 0x1.
+
+    Only the first call sends SET_RESOURCES; subsequent KCQ activations reuse the SET_RESOURCES
+    state already latched in MEC and only send MAP_QUEUES (one packet per additional ring).
+    """
+    mec = max(0, ring_me - 1)
+    set_resource_bit = mec * 32 + ring_pipe * 8 + ring_queue
+    queue_mask = 1 << set_resource_bit
+    mq_dwords = self._build_kiq_map_queues(ring_me, ring_pipe, ring_queue, doorbell_idx, mqd_addr, wptr_addr)
+    if not self.kiq_set_resources_sent:
+      sr_dwords = self._build_kiq_set_resources(queue_mask, self.kiq_cleaner_shader_va)
+      batch = sr_dwords + mq_dwords
+      print(f"am {self.adev.devfmt}: KIQ enable_kcq: batched SET_RESOURCES (queue_mask=0x{queue_mask:x}, cleaner_shader_va=0x{self.kiq_cleaner_shader_va:x}) + MAP_QUEUES (me={ring_me} pipe={ring_pipe} queue={ring_queue}), {len(batch)} dwords")
+      self._kiq_submit_packets(batch)
+      self.kiq_set_resources_sent = True
+    else:
+      print(f"am {self.adev.devfmt}: KIQ enable_kcq: MAP_QUEUES only (me={ring_me} pipe={ring_pipe} queue={ring_queue}), {len(mq_dwords)} dwords")
+      self._kiq_submit_packets(mq_dwords)
 
   def fini_hw(self): self._dequeue_hqds()
 
@@ -615,12 +635,12 @@ class AM_GFX(AM_IP):
       self.adev.gmc.flush_hdp()
       self._grbm_select(inst=xcc)
 
-    # KIQ MAP_QUEUES bootstrap: if the KIQ is alive, submit a MAP_QUEUES PM4 packet for our compute
-    # queue. This tells MEC's scheduler to start dispatching this queue. Without this, MEC has the
-    # HQD active but never picks it up because no SET_RESOURCES/MAP_QUEUES sequence ever ran.
+    # Linux amdgpu_gfx_enable_kcq() parity: batch SET_RESOURCES + MAP_QUEUES into one KIQ
+    # submission for the first KCQ (so MEC sees both without a scheduling-failure window),
+    # then MAP_QUEUES alone for any subsequent KCQs. See _kiq_enable_kcq() for the rationale.
     if getattr(self, 'kiq_setup_done', False) and not aql:
       try:
-        self._kiq_map_queues(ring_me=1, ring_pipe=pipe, ring_queue=queue,
+        self._kiq_enable_kcq(ring_me=1, ring_pipe=pipe, ring_queue=queue,
                              doorbell_idx=doorbell, mqd_addr=self.mqd_mc[queue],
                              wptr_addr=wptr_addr)
         time.sleep(0.05)
