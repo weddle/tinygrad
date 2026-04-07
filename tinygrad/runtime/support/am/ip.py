@@ -360,7 +360,11 @@ class AM_GFX(AM_IP):
       cp_hqd_pq_rptr_report_addr_lo=lo32(self.kiq_rptr_addr), cp_hqd_pq_rptr_report_addr_hi=hi32(self.kiq_rptr_addr),
       cp_hqd_pq_wptr_poll_addr_lo=lo32(self.kiq_wptr_addr), cp_hqd_pq_wptr_poll_addr_hi=hi32(self.kiq_wptr_addr),
       cp_hqd_pq_doorbell_control=self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.encode(doorbell_offset=self.kiq_doorbell_idx*2, doorbell_en=1),
-      cp_hqd_pq_control=self.adev.regCP_HQD_PQ_CONTROL.encode(rptr_block_size=5, unord_dispatch=0,
+      # Linux gfx_v10_0_compute_mqd_init sets UNORD_DISPATCH=1 for all compute MQDs (including KIQ
+      # which shares this init path). Previous tinygrad value of 0 left MEC unable to consume
+      # packets from the KIQ ring — HQD active but RPTR stays 0. See investigation log 2026-04-07
+      # "KIQ/KCQ queue-map parity audit" entry.
+      cp_hqd_pq_control=self.adev.regCP_HQD_PQ_CONTROL.encode(rptr_block_size=5, unord_dispatch=1,
         queue_size=(self.kiq_ring_size//4).bit_length()-2),
       cp_hqd_ib_control=self.adev.regCP_HQD_IB_CONTROL.encode(min_ib_avail_size=0x3),
       cp_hqd_hq_status0=0x20004000,
@@ -410,6 +414,19 @@ class AM_GFX(AM_IP):
     kiq_active = self.adev.regCP_HQD_ACTIVE.read()
     self._grbm_select(inst=0)
     print(f"am {self.adev.devfmt}: KIQ post-SET_RESOURCES: ACTIVE=0x{kiq_active:x} RPTR=0x{kiq_rptr:x} WPTR=0x{kiq_wptr:x} (host_wptr_bytes={self.kiq_host_wptr_dws*4})")
+
+    # AMD_KIQ_DBC_REARM=1: re-arm CP_HQD_PQ_DOORBELL_CONTROL after _kiq_set_resources. On RDNA2
+    # with MEC firmware not actually running, the CP's "failed scheduling" cleanup path clears
+    # DOORBELL_EN and WPTR_LO ~100ms after the first doorbell delivery fails to be consumed.
+    # That clobber drops all subsequent submissions (MAP_QUEUES, test packets) unless the bit
+    # is re-armed. Default-off: this is a diagnostic workaround for the compute-arc investigation
+    # and should not be relied on in production. See tiny-egpu docs/rdna2-investigation-log.md
+    # 2026-04-07 KIQ clobber trace entry for the full characterization.
+    if getenv("AMD_KIQ_DBC_REARM", 0):
+      self._grbm_select(me=self.kiq_me, pipe=self.kiq_pipe, queue=self.kiq_queue, inst=0)
+      self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.write(0x40000000)  # DOORBELL_EN=1, OFFSET=0
+      self._grbm_select(inst=0)
+      print(f"am {self.adev.devfmt}: AMD_KIQ_DBC_REARM=1 re-armed KIQ CP_HQD_PQ_DOORBELL_CONTROL", flush=True)
 
   def _kiq_submit_packets(self, dwords):
     """Write PM4 dwords into the KIQ ring buffer and ring the KIQ doorbell.
@@ -549,7 +566,9 @@ class AM_GFX(AM_IP):
         cp_hqd_pq_rptr_report_addr_lo=lo32(rptr_addr), cp_hqd_pq_rptr_report_addr_hi=hi32(rptr_addr),
         cp_hqd_pq_wptr_poll_addr_lo=lo32(wptr_addr), cp_hqd_pq_wptr_poll_addr_hi=hi32(wptr_addr),
         cp_hqd_pq_doorbell_control=self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.encode(doorbell_offset=doorbell*2, doorbell_en=1),
-        cp_hqd_pq_control=self.adev.regCP_HQD_PQ_CONTROL.encode(rptr_block_size=5, unord_dispatch=0, queue_size=(ring_size//4).bit_length()-2,
+        # UNORD_DISPATCH=1 matches Linux gfx_v10_0_compute_mqd_init for all compute queues.
+        # See KIQ MQD above + investigation log entry for the KIQ/KCQ parity audit.
+        cp_hqd_pq_control=self.adev.regCP_HQD_PQ_CONTROL.encode(rptr_block_size=5, unord_dispatch=1, queue_size=(ring_size//4).bit_length()-2,
           **({'queue_full_en':1, 'slot_based_wptr':2, 'no_update_rptr':xcc!=0 or self.xccs==1} if aql else {})),
         cp_hqd_ib_control=self.adev.regCP_HQD_IB_CONTROL.encode(min_ib_avail_size=0x3), cp_hqd_hq_status0=0x20004000,
         cp_mqd_control=self.adev.regCP_MQD_CONTROL.encode(priv_state=1), cp_hqd_vmid=0, cp_hqd_aql_control=int(aql),
