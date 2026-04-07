@@ -82,6 +82,27 @@ Important caveats:
 If you want stable general tinygrad behavior, use the official upstream repo.
 If you want to study or reproduce this RDNA2-on-mac bring-up effort, this fork is the preserved code line for that work.
 
+### Modified files in this fork
+
+Relative to upstream `tinygrad`, the active bring-up branch currently modifies this file set:
+
+- `README.md`
+- `tinygrad/runtime/autogen/am/__init__.py`
+- `tinygrad/runtime/autogen/am/v10_extra.py`
+- `tinygrad/runtime/ops_amd.py`
+- `tinygrad/runtime/support/am/amdev.py`
+- `tinygrad/runtime/support/am/ip.py`
+- `tinygrad/runtime/support/amd.py`
+- `tinygrad/runtime/support/hcq.py`
+
+In practice, most of the RDNA2 bring-up work is concentrated in:
+
+- `tinygrad/runtime/support/am/ip.py`
+- `tinygrad/runtime/support/am/amdev.py`
+- `tinygrad/runtime/ops_amd.py`
+
+The other touched files are supporting surfaces needed to keep the AM path coherent on this branch.
+
 ---
 
 ## How tinygrad compares
