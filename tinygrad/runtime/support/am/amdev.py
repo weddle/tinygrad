@@ -124,8 +124,18 @@ class AMFirmware:
       self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.ctx_ucode_size_bytes, am.GFX_FW_TYPE_SDMA_UCODE_TH0)]
     else: self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.ucode_size_bytes, am.GFX_FW_TYPE_SDMA_UCODE_TH0)]
 
-    # PFP, ME, MEC firmware
-    for (fw_name, fw_cnt) in ([('PFP', 1), ('ME', 1)] if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0) else []) + [('MEC', 1)]:
+    # CP firmware loading. The set depends on the gfx generation:
+    # - RDNA2 / gfx10.x: Linux gfx_v10_0_init_microcode loads PFP + ME + CE + MEC (+ optional MEC2).
+    #   Linux's gfx_v10_0_rlc_backdoor_autoload_enable stages all of them into the RLC autoload
+    #   bundle alongside RLC_G and SDMA. Without the full CP set, MEC firmware does not promote
+    #   even with AUTOLOAD_RLC fired (CP_MEC_ME1_HEADER_DUMP stays 0xdef0def0 post-init).
+    # - gfx12+ (RS64 microcode): PFP + ME + MEC only. CE was deprecated.
+    # - older gens fall back to MEC-only until this file has a verified path.
+    _gc_ver = self.adev.ip_ver[am.GC_HWIP]
+    if (10,0,0) <= _gc_ver < (11,0,0): _cp_fws = [('PFP', 1), ('ME', 1), ('CE', 1), ('MEC', 1)]
+    elif _gc_ver >= (12,0,0):          _cp_fws = [('PFP', 1), ('ME', 1), ('MEC', 1)]
+    else:                              _cp_fws = [('MEC', 1)]
+    for (fw_name, fw_cnt) in _cp_fws:
       blob, hdr = self.load_fw(f"gc_{fmt_ver(am.GC_HWIP)}_{fw_name.lower()}.bin", versioned_header="struct_gfx_firmware_header")
 
       ucode_off = hdr.header.ucode_array_offset_bytes
