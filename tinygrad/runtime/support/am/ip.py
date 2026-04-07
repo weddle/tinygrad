@@ -974,12 +974,36 @@ class AM_PSP(AM_IP):
     if hasattr(self.adev.fw, 'smu_psp_desc'): self._load_ip_fw_cmd(*self.adev.fw.smu_psp_desc)
     if not self.boot_time_tmr or not self.autoload_tmr: self._tmr_load_cmd()
 
+    # AMD_PSP_DESC_AUDIT=1: optional read-only audit log of the exact PSP descriptor load order
+    # before the loop runs. Off by default. Kept for investigation traceability.
+    if getenv("AMD_PSP_DESC_AUDIT", 0) == 1:
+      print(f"am {self.adev.devfmt}: PSP descriptor load order ({len(self.adev.fw.descs)} descs):", flush=True)
+      for _i, _d in enumerate(self.adev.fw.descs):
+        _types = _d[0] if isinstance(_d, (tuple, list)) and len(_d) >= 1 else _d
+        print(f"  [{_i:2d}] types={_types}", flush=True)
+
     for psp_desc in self.adev.fw.descs: self._load_ip_fw_cmd(*psp_desc)
 
-    if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0): self._rlc_autoload_cmd()
+    # Issue GFX_CMD_ID_AUTOLOAD_RLC on gfx10+ (including RDNA2 / Sienna Cichlid / Navi21). Linux's
+    # psp_v11_0 autoload path does this for Navi21-class ASICs after the descriptor load loop; it
+    # is the PSP-side trigger that finalizes the autoloaded firmware set (SMU, SDMA, MEC, RLC G/DRAM/IRAM)
+    # into running microcode. Without it, tinygrad's fw descriptors landed in PSP staging but the
+    # SDMA/MEC firmware was never actually promoted to the engines' F32/MEC cores.
+    #
+    # Historical note: this gate used to require GC_HWIP >= (11,0,0), which excluded RDNA2
+    # entirely. The fallback elif for PSP_FW_TYPE_PSP_RL was also a no-op on Sienna Cichlid because
+    # sienna_cichlid_sos.bin has rl.size_bytes == 0. Net effect: no PSP autoload trigger was ever
+    # issued on RDNA2, SDMA0_UCODE_CHECKSUM stayed at 0x0, and the first SDMA ring test stalled at
+    # parser-to-dispatch (RB_RPTR_FETCH advanced but RB_RPTR never retired).
+    #
+    # Widening the gate to >= (10,0,0) was the final missing piece after the full SDMA-local parity
+    # stack (runtime soft reset, AUTO_CTXSW_ENABLE, BIF_SDMA0_DOORBELL_RANGE, CONTEXT0_CNTL reserved
+    # bit clear, 16-dword packet padding, Linux-order setup_ring sequence). See tiny-egpu:
+    # docs/rdna2-investigation-log.md "MILESTONE: RDNA2 SDMA ring test passes".
+    if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0):
+      self._rlc_autoload_cmd()
     elif am.PSP_FW_TYPE_PSP_RL in self.adev.fw.sos_fw:
-      # GFX10 (RDNA2) loads REG_LIST from the SOS firmware's RL section. Sienna Cichlid's
-      # sienna_cichlid_sos.bin has rl.size_bytes == 0 — no RL section — so skip the load.
+      # gfx<10 (vega/mi etc.): load REG_LIST from the SOS firmware's RL section.
       self._load_ip_fw_cmd([am.GFX_FW_TYPE_REG_LIST], self.adev.fw.sos_fw[am.PSP_FW_TYPE_PSP_RL])
 
   def is_sos_alive(self): return self.adev.reg(f"{self.reg_pref}_81").read() != 0x0
