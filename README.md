@@ -32,6 +32,58 @@ It’s inspired by PyTorch (ergonomics), JAX (functional transforms and IR-based
 
 ---
 
+## Fork status
+
+This repository is a **working fork of the official [`tinygrad/tinygrad`](https://github.com/tinygrad/tinygrad) repo**.
+
+Its current purpose is narrow:
+
+- bring up and debug **RDNA2 AMD support on macOS**
+- test specifically against a **Radeon RX 6900 XT** (`gfx1030`, Navi21 / Sienna Cichlid)
+- preserve milestone code while the live bring-up work happens in a patched environment
+
+This fork should be treated as **reference-only** unless you are intentionally following the same bring-up work.
+
+### Hardware under test
+
+The current test path for this fork is:
+
+- Mac mini M4
+- USB4 / Thunderbolt 4
+- ASM2464PD-based Ugreen NVMe enclosure
+- M.2 to OCuLink adapter
+- OCuLink eGPU setup
+- Radeon RX 6900 XT
+
+### Methodology
+
+This branch is being advanced by treating upstream Linux `amdgpu` as the ground truth for bring-up behavior:
+
+- read the Linux `amdgpu` sources line-by-line
+- identify one concrete semantic difference at a time
+- port that narrow behavior into tinygrad's AM runtime
+- test directly on hardware
+- power cycle / restart between meaningful probes when required
+- keep only changes that move the failure boundary in a reproducible way
+
+This is not a speculative feature branch and it is not meant to represent polished, production-ready AMD support on macOS.
+
+### Use-at-your-own-risk
+
+This fork is currently in **use at your own risk** territory.
+
+Important caveats:
+
+- it contains bring-up-oriented changes that are useful for investigation but not yet proven safe or complete
+- it may regress, wedge hardware, require power cycles, or depend on platform-specific setup
+- commits here should not be read as upstream-ready unless explicitly stated
+- behavior that works on the hardware path above may not generalize to other Macs, bridges, enclosures, GPUs, or firmware combinations
+
+If you want stable general tinygrad behavior, use the official upstream repo.
+If you want to study or reproduce this RDNA2-on-mac bring-up effort, this fork is the preserved code line for that work.
+
+---
+
 ## How tinygrad compares
 
 **PyTorch**
