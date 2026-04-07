@@ -769,6 +769,32 @@ class AM_IH(AM_IP):
 class AM_SDMA(AM_IP):
   def init_sw(self): self.sdma_reginst, self.sdma_name = [], "F32" if self.adev.ip_ver[am.SDMA0_HWIP] < (7,0,0) else "MCU"
   def init_hw(self):
+    # RDNA2 (sdma_v5_2) soft-reset pulse. Linux's sdma_v5_2_start() begins with
+    # sdma_v5_2_soft_reset() before enable(HALT=0) / ctx_switch_enable / gfx_resume. It pulses
+    # GRBM_SOFT_RESET.SOFT_RESET_SDMA0 (bit 23, mask 0x00800000) with a udelay(50) on each side,
+    # to bring the engine out of whatever state the previous owner (boot ROM / prior driver / PSP)
+    # left it in. Must run BEFORE the UTCL1/F32/SDMA0_CNTL init below — post-init pulses corrupt
+    # the state we just programmed and regress to a walker fault. Only valid remaining test of
+    # the Linux start-order branch for the stuck-RPTR / CTXSW_ABLE=0 condition on Navi 21.
+    if self.adev.ip_ver[am.SDMA0_HWIP][0] == 5 and self.adev.ip_ver[am.SDMA0_HWIP] <= (5,2,0):
+      _SOFT_RESET_SDMA0_BIT = 1 << 23
+      _gsr_before = self.adev.regGRBM_SOFT_RESET.read()
+      self.adev.regGRBM_SOFT_RESET.write(_gsr_before | _SOFT_RESET_SDMA0_BIT)
+      self.adev.regGRBM_SOFT_RESET.read()  # post the write
+      time.sleep(50e-6)
+      self.adev.regGRBM_SOFT_RESET.write(_gsr_before & ~_SOFT_RESET_SDMA0_BIT)
+      self.adev.regGRBM_SOFT_RESET.read()
+      time.sleep(50e-6)
+
+    # Linux-order parity: for RDNA2 sdma_v5_2, all of UTCL1_CNTL, UTCL1_PAGE, F32_CNTL, and
+    # SDMA0_CNTL (UTC_L1_ENABLE, MIDCMD_PREEMPT_ENABLE, AUTO_CTXSW_ENABLE) are programmed
+    # inside sdma_v5_2_gfx_resume_instance AFTER queue/ring register programming, not during
+    # ip_block init. tinygrad previously landed them here in init_hw, which produces the
+    # parser-to-dispatch stall (RB_RPTR_FETCH advances, PACKET_READY=1, but CMD_OP stays 0
+    # and CTXSW_READY never asserts). This flag pushes them out of init_hw for v5.2 and into
+    # setup_ring so they land in Linux order just before RB_ENABLE / IB_ENABLE.
+    _is_sdma_v52 = self.adev.ip_ver[am.SDMA0_HWIP][0] == 5 and self.adev.ip_ver[am.SDMA0_HWIP] <= (5,2,0)
+
     for pipe_id in range(16 if self.adev.ip_ver[am.SDMA0_HWIP] < (5,0,0) else 1):
       pipe, inst = ("", pipe_id) if self.adev.ip_ver[am.SDMA0_HWIP] < (5,0,0) else (str(pipe_id), 0)
 
@@ -780,20 +806,16 @@ class AM_SDMA(AM_IP):
         self.adev.reg(f"regSDMA{pipe}_UTCL1_PAGE").update(rd_l2_policy=2, wr_l2_policy=3, **({'llc_noalloc':1} if self.sdma_name == "F32" else {}),
                                                           inst=inst)
         self.adev.reg(f"regSDMA{pipe}_{self.sdma_name}_CNTL").update(halt=0, **{f"{'th1_' if self.sdma_name == 'F32' else ''}reset":0}, inst=inst)
-      else:
-        # SDMA < 6.0.0 (RDNA2 sdma_v5_2 etc.) — Linux's sdma_v5_2_gfx_resume_instance programs UTCL1
-        # cache + cntl unconditionally for v5.2, then clears F32 HALT (and we additionally clear RESET,
-        # which the kernel calls TH1_RESET on newer parts). Without UTCL1_CNTL/UTCL1_PAGE the L1
-        # translation cache defaults are wrong and the engine accepts register writes but doesn't
-        # actually perform DMA. The order matches Linux: UTCL1 config first, then unhalt.
+      elif not _is_sdma_v52:
+        # SDMA < 6.0.0 AND NOT v5.2 (e.g., v4.x) — keep the prior tinygrad init ordering.
+        # v5.2 falls through to setup_ring for Linux-order parity.
         self.adev.reg(f"regSDMA{pipe}_UTCL1_CNTL").update(resp_mode=3, redo_delay=9, inst=inst)
         self.adev.reg(f"regSDMA{pipe}_UTCL1_PAGE").update(rd_l2_policy=2, wr_l2_policy=3, llc_noalloc=1, inst=inst)
         self.adev.reg(f"regSDMA{pipe}_F32_CNTL").update(halt=0, reset=0, inst=inst)
 
-      # MIDCMD_PREEMPT_ENABLE is set alongside UTC_L1_ENABLE in Linux's sdma_v5_2 path; without it the
-      # engine's command parser may stall on the first packet even with a valid wptr.
-      self.adev.reg(f"regSDMA{pipe}_CNTL").update(trap_enable=1,
-        **({'utc_l1_enable':1, 'midcmd_preempt_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP] <= (5,2,0) else {}), inst=inst)
+      if not _is_sdma_v52:
+        # v5.2 SDMA0_CNTL programming also deferred to setup_ring below.
+        self.adev.reg(f"regSDMA{pipe}_CNTL").update(trap_enable=1, inst=inst)
 
     if self.adev.ip_ver[am.NBIO_HWIP] in {(7,9,0), (7,9,1)}:
       for aid_id in range(4):
@@ -874,6 +896,30 @@ class AM_SDMA(AM_IP):
     # engine never picks up subsequent wptr changes.
     self.adev.wreg_pair(f"{reg}_RB_WPTR", "", "_HI", 0, inst=inst)
     self.adev.reg(f"{reg}_MINOR_PTR_UPDATE").write(0x0, inst=inst)
+    # RDNA2 sdma_v5_2 Linux-order parity block: Linux's sdma_v5_2_gfx_resume_instance runs the
+    # following writes AFTER queue/ring programming and BEFORE RB_ENABLE / IB_ENABLE:
+    #   SDMA0_CNTL (UTC_L1_ENABLE | MIDCMD_PREEMPT_ENABLE | AUTO_CTXSW_ENABLE | TRAP_ENABLE)
+    #   UTCL1_CNTL (resp_mode=3, redo_delay=9)
+    #   UTCL1_PAGE (rd_l2_policy=2, wr_l2_policy=3, llc_noalloc=1)
+    #   F32_CNTL.HALT=0, RESET=0
+    # tinygrad previously programmed these in AM_SDMA.init_hw, which made the queue reach
+    # parser-to-dispatch but never retire. Moving them here so they land in Linux order.
+    if self.adev.ip_ver[am.SDMA0_HWIP][0] == 5 and self.adev.ip_ver[am.SDMA0_HWIP] <= (5,2,0):
+      self.adev.reg(f"regSDMA{pipe}_CNTL").update(trap_enable=1, utc_l1_enable=1, midcmd_preempt_enable=1, auto_ctxsw_enable=1, inst=inst)
+      self.adev.reg(f"regSDMA{pipe}_UTCL1_CNTL").update(resp_mode=3, redo_delay=9, inst=inst)
+      self.adev.reg(f"regSDMA{pipe}_UTCL1_PAGE").update(rd_l2_policy=2, wr_l2_policy=3, llc_noalloc=1, inst=inst)
+      self.adev.reg(f"regSDMA{pipe}_F32_CNTL").update(halt=0, reset=0, inst=inst)
+
+    # RB_CNTL pre-write log (diagnostic only, cheap): Linux preserves the existing RB_CNTL
+    # value and only sets RB_SIZE, RPTR_WRITEBACK_ENABLE, RB_ENABLE. tinygrad force-writes
+    # rb_priv=1, rb_vmid=0, rptr_writeback_timer=4 in addition. Capture the pre-write value
+    # so diagnostic runs can see exactly what's being replaced.
+    if self.adev.ip_ver[am.SDMA0_HWIP][0] == 5:
+      try:
+        _rb_cntl_pre = self.adev.reg(f"{reg}_RB_CNTL").read(inst=inst)
+        print(f"am {self.adev.devfmt}: {reg}_RB_CNTL pre-write = 0x{_rb_cntl_pre:08x}", flush=True)
+      except Exception: pass
+
     # WPTR_POLL_ENABLE was added in RDNA3+ (SDMA 6.x) inside RB_CNTL itself. RDNA2 SDMA v5.2's
     # regSDMA0_GFX_RB_CNTL has no such field — only RB_ENABLE, RB_SIZE, RB_VMID, RPTR_WRITEBACK_*,
     # RB_PRIV, RPTR_WB_IDLE. The v5.2 equivalent (F32_POLL_ENABLE) lives in WPTR_POLL_CNTL, set above.
