@@ -36,6 +36,16 @@ It’s inspired by PyTorch (ergonomics), JAX (functional transforms and IR-based
 
 This repository is a **working fork of the official [`tinygrad/tinygrad`](https://github.com/tinygrad/tinygrad) repo**.
 
+**Current bring-up status:** [STATUS.md](STATUS.md)
+
+That file is the main project readout for this fork. It tracks:
+- current hardware and methodology
+- what is implemented
+- what is working
+- what is still broken
+- what has been tested and ruled out
+- open investigation branches and requests for community feedback
+
 Its current purpose is narrow:
 
 - bring up and debug **RDNA2 AMD support on macOS**
