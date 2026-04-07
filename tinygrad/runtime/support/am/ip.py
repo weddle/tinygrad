@@ -366,7 +366,14 @@ class AM_GFX(AM_IP):
       cp_hqd_pq_base_lo=lo32(self.kiq_ring_va >> 8), cp_hqd_pq_base_hi=hi32(self.kiq_ring_va >> 8),
       cp_hqd_pq_rptr_report_addr_lo=lo32(self.kiq_rptr_addr), cp_hqd_pq_rptr_report_addr_hi=hi32(self.kiq_rptr_addr),
       cp_hqd_pq_wptr_poll_addr_lo=lo32(self.kiq_wptr_addr), cp_hqd_pq_wptr_poll_addr_hi=hi32(self.kiq_wptr_addr),
-      cp_hqd_pq_doorbell_control=self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.encode(doorbell_offset=self.kiq_doorbell_idx*2, doorbell_en=1),
+      # Linux gfx_v10_0_compute_mqd_init writes the bare doorbell_index (not shifted) into the
+      # DOORBELL_OFFSET field; REG_SET_FIELD + the register field definition handle the bit
+      # placement. tinygrad's .encode() does the same, so pass the bare index here — the old
+      # `self.kiq_doorbell_idx*2` was a double-shift that happened to be masked on KIQ because
+      # kiq_doorbell_idx=0. On KCQs with nonzero doorbell indices it caused a host↔HQD routing
+      # mismatch (host doorbell BAR write didn't reach the HQD because its DOORBELL_OFFSET
+      # field was double what the host thought).
+      cp_hqd_pq_doorbell_control=self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.encode(doorbell_offset=self.kiq_doorbell_idx, doorbell_en=1),
       # Linux gfx_v10_0_compute_mqd_init sets UNORD_DISPATCH=1 for all compute MQDs (including KIQ
       # which shares this init path). Previous tinygrad value of 0 left MEC unable to consume
       # packets from the KIQ ring — HQD active but RPTR stays 0. See investigation log 2026-04-07
@@ -395,7 +402,7 @@ class AM_GFX(AM_IP):
       self.adev.wreg(reg, mqd_st_mv[0x80 + i])
 
     # KFD-parity activation tail
-    self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.update(doorbell_en=1, doorbell_offset=self.kiq_doorbell_idx*2)
+    self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.update(doorbell_en=1, doorbell_offset=self.kiq_doorbell_idx)
     try: self.adev.regCP_PQ_WPTR_POLL_CNTL1.write(1 << (self.kiq_pipe * 8 + self.kiq_queue))
     except Exception: pass
     try: self.adev.regCP_HQD_EOP_RPTR.update(init_fetcher=1)
@@ -585,7 +592,11 @@ class AM_GFX(AM_IP):
         cp_hqd_pq_base_lo=lo32(ring_addr>>8), cp_hqd_pq_base_hi=hi32(ring_addr>>8),
         cp_hqd_pq_rptr_report_addr_lo=lo32(rptr_addr), cp_hqd_pq_rptr_report_addr_hi=hi32(rptr_addr),
         cp_hqd_pq_wptr_poll_addr_lo=lo32(wptr_addr), cp_hqd_pq_wptr_poll_addr_hi=hi32(wptr_addr),
-        cp_hqd_pq_doorbell_control=self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.encode(doorbell_offset=doorbell*2, doorbell_en=1),
+        # See KIQ MQD above: pass bare doorbell index to .encode(); the register field definition
+        # handles the bit placement. Previous tinygrad `doorbell*2` double-shifted the offset
+        # field, breaking host↔HQD doorbell routing on KCQs with nonzero doorbell indices
+        # (AMDGPU_NAVI10_DOORBELL_MEC_RING0=0x003 → field ended up as 6 instead of 3).
+        cp_hqd_pq_doorbell_control=self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.encode(doorbell_offset=doorbell, doorbell_en=1),
         # UNORD_DISPATCH=1 matches Linux gfx_v10_0_compute_mqd_init for all compute queues.
         # See KIQ MQD above + investigation log entry for the KIQ/KCQ parity audit.
         cp_hqd_pq_control=self.adev.regCP_HQD_PQ_CONTROL.encode(rptr_block_size=5, unord_dispatch=1, queue_size=(ring_size//4).bit_length()-2,
@@ -609,7 +620,7 @@ class AM_GFX(AM_IP):
           self.adev.wreg(reg, mqd_st_mv[0x80 + i])
 
         # KFD HQD-direct activation tail — matching kgd_hqd_load() in amdgpu_amdkfd_gfx_v10.c.
-        self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.update(doorbell_en=1, doorbell_offset=doorbell*2, inst=xcc)
+        self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.update(doorbell_en=1, doorbell_offset=doorbell, inst=xcc)
         _queue_mask = 1 << (pipe * 8 + queue)
         try:
           self.adev.regCP_PQ_WPTR_POLL_CNTL1.write(_queue_mask, inst=xcc)
