@@ -378,7 +378,11 @@ class AM_GFX(AM_IP):
       # which shares this init path). Previous tinygrad value of 0 left MEC unable to consume
       # packets from the KIQ ring — HQD active but RPTR stays 0. See investigation log 2026-04-07
       # "KIQ/KCQ queue-map parity audit" entry.
-      cp_hqd_pq_control=self.adev.regCP_HQD_PQ_CONTROL.encode(rptr_block_size=5, unord_dispatch=1,
+      # Linux gfx_v10_0_compute_mqd_init sets PRIV_STATE=1 and KMD_QUEUE=1 in CP_HQD_PQ_CONTROL
+      # for ALL compute MQDs (KIQ + KCQ). Without KMD_QUEUE=1 MEC treats the queue as a
+      # user-mode queue and the scheduler refuses to fetch from it (observed empirically: KCQ
+      # ACTIVE=1 but RPTR stays 0). RPTR_BLOCK_SIZE matches Linux's order_base_2(PAGE/4)-1=9.
+      cp_hqd_pq_control=self.adev.regCP_HQD_PQ_CONTROL.encode(rptr_block_size=9, unord_dispatch=1, priv_state=1, kmd_queue=1,
         queue_size=(self.kiq_ring_size//4).bit_length()-2),
       cp_hqd_ib_control=self.adev.regCP_HQD_IB_CONTROL.encode(min_ib_avail_size=0x3),
       cp_hqd_hq_status0=0x20004000,
@@ -597,9 +601,13 @@ class AM_GFX(AM_IP):
         # field, breaking host↔HQD doorbell routing on KCQs with nonzero doorbell indices
         # (AMDGPU_NAVI10_DOORBELL_MEC_RING0=0x003 → field ended up as 6 instead of 3).
         cp_hqd_pq_doorbell_control=self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.encode(doorbell_offset=doorbell, doorbell_en=1),
-        # UNORD_DISPATCH=1 matches Linux gfx_v10_0_compute_mqd_init for all compute queues.
-        # See KIQ MQD above + investigation log entry for the KIQ/KCQ parity audit.
-        cp_hqd_pq_control=self.adev.regCP_HQD_PQ_CONTROL.encode(rptr_block_size=5, unord_dispatch=1, queue_size=(ring_size//4).bit_length()-2,
+        # Linux gfx_v10_0_compute_mqd_init unconditionally sets PRIV_STATE=1 and KMD_QUEUE=1 for
+        # all compute MQDs (KIQ and KCQ). Without KMD_QUEUE=1 MEC's compute scheduler treats the
+        # queue as user-mode and refuses to fetch from it (observed empirically: MAP_QUEUES sets
+        # ACTIVE=1 but KCQ rptr stays 0 forever). KIQ "works" without these flags because it
+        # goes through a separate code path tied to RLC_CP_SCHEDULERS.scheduler0, not the normal
+        # compute scheduler. RPTR_BLOCK_SIZE=9 matches Linux's order_base_2(PAGE/4)-1.
+        cp_hqd_pq_control=self.adev.regCP_HQD_PQ_CONTROL.encode(rptr_block_size=9, unord_dispatch=1, priv_state=1, kmd_queue=1, queue_size=(ring_size//4).bit_length()-2,
           **({'queue_full_en':1, 'slot_based_wptr':2, 'no_update_rptr':xcc!=0 or self.xccs==1} if aql else {})),
         cp_hqd_ib_control=self.adev.regCP_HQD_IB_CONTROL.encode(min_ib_avail_size=0x3), cp_hqd_hq_status0=0x20004000,
         cp_mqd_control=self.adev.regCP_MQD_CONTROL.encode(priv_state=1), cp_hqd_vmid=0, cp_hqd_aql_control=int(aql),
@@ -641,6 +649,18 @@ class AM_GFX(AM_IP):
         # DEFAULT MAP_QUEUES path — matches Linux gfx_v10_0_kcq_init_queue: build MQD only,
         # let MEC firmware load it via MAP_QUEUES PM4 packet through the KIQ ring (issued
         # below, after this loop).
+        #
+        # Set the per-queue WPTR_POLL enable bit in CP_PQ_WPTR_POLL_CNTL1. Empirically on
+        # RDNA2 (RX 6900 XT) MEC activates the queue via MAP_QUEUES (ACTIVE=1) but does NOT
+        # poll the host wptr_gpu_addr until this bit is set for the target (pipe, queue).
+        # The bit layout is `1 << (pipe * 8 + queue)`. The KFD direct-HQD fallback path above
+        # already does this write; Linux's amdgpu MAP_QUEUES path appears to rely on MEC to
+        # enable polling internally, but MEC isn't doing so on this hardware / firmware combo.
+        # Pulling the write out of the fallback gate is a single-variable test; if this is the
+        # missing ingredient, the compute queue rptr will start advancing.
+        _queue_mask = 1 << (pipe * 8 + queue)
+        try: self.adev.regCP_PQ_WPTR_POLL_CNTL1.write(_queue_mask, inst=xcc)
+        except Exception as e: print(f"am {self.adev.devfmt}: CP_PQ_WPTR_POLL_CNTL1 write failed: {e}")
         print(f"am {self.adev.devfmt}: KCQ MQD built; activation deferred to KIQ MAP_QUEUES")
 
       self.adev.gmc.flush_hdp()
