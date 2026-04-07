@@ -559,7 +559,11 @@ class AM_GFX(AM_IP):
     self._enable_mec()
 
   def setup_ring(self, ring_addr:int, ring_size:int, rptr_addr:int, wptr_addr:int, eop_addr:int, eop_size:int, idx:int, aql:bool) -> int:
-    pipe, queue, doorbell = idx // 4, idx % 4, am.AMDGPU_NAVI10_DOORBELL_MEC_RING0
+    pipe, queue = idx // 4, idx % 4
+    # Linux gfx_v10_0_kcq_init_queue() pre-normalizes compute-ring doorbells as
+    # (mec_ring0 + ring_id) << 1 and then reuses that same ring->doorbell_index
+    # across the MQD, MAP_QUEUES packet, and host WDOORBELL64 path.
+    doorbell = (am.AMDGPU_NAVI10_DOORBELL_MEC_RING0 + idx) << 1
 
     # ARCHITECTURAL SHIFT: Linux gfx_v10_0_kcq_init_queue does NOT directly write HQD registers
     # for KCQs. KCQs only get an MQD built in memory, then activated via MAP_QUEUES PM4 packet
@@ -619,10 +623,9 @@ class AM_GFX(AM_IP):
         cp_hqd_pq_base_lo=lo32(ring_addr>>8), cp_hqd_pq_base_hi=hi32(ring_addr>>8),
         cp_hqd_pq_rptr_report_addr_lo=lo32(rptr_addr), cp_hqd_pq_rptr_report_addr_hi=hi32(rptr_addr),
         cp_hqd_pq_wptr_poll_addr_lo=lo32(wptr_addr), cp_hqd_pq_wptr_poll_addr_hi=hi32(wptr_addr),
-        # See KIQ MQD above: pass bare doorbell index to .encode(); the register field definition
-        # handles the bit placement. Previous tinygrad `doorbell*2` double-shifted the offset
-        # field, breaking host↔HQD doorbell routing on KCQs with nonzero doorbell indices
-        # (AMDGPU_NAVI10_DOORBELL_MEC_RING0=0x003 → field ended up as 6 instead of 3).
+        # On gfx10 compute rings Linux stores the already-normalized
+        # ring->doorbell_index = (mec_ring0 + ring_id) << 1 in the MQD doorbell
+        # field. Keep KIQ's raw convention separate; this path is KCQ-only.
         cp_hqd_pq_doorbell_control=self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.encode(doorbell_offset=doorbell, doorbell_en=1),
         # Linux gfx_v10_0_compute_mqd_init unconditionally sets PRIV_STATE=1 and KMD_QUEUE=1 for
         # all compute MQDs (KIQ and KCQ). Without KMD_QUEUE=1 MEC's compute scheduler treats the
