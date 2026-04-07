@@ -80,6 +80,25 @@ class AMDSignal(HCQSignal):
         host_wptr = cq.write_ptr[0] if cq.write_ptr is not None else None
         host_rptr = cq.read_ptr[0] if cq.read_ptr is not None else None
         print(f"  compute_queue: put_value={host_put}  write_ptr[0]={host_wptr}  read_ptr[0]={host_rptr}")
+        # Dump the first N dwords of the compute queue ring as the host sees it (via cpu_view).
+        # ring is an MMIOInterface formatted as 'I' (uint32 dwords) — read ints directly, do not
+        # try to convert via bytes() which fails because each element is a 32-bit int.
+        try:
+          ring = getattr(cq, 'ring', None)
+          if ring is not None and hasattr(ring, '__getitem__'):
+            n_dws = min(64, max(32, host_put // 4 if host_put else 32))
+            dws = []
+            for i in range(n_dws):
+              try: dws.append(int(ring[i]))
+              except Exception: break
+            print(f"  compute_queue ring (host cpu_view) first {len(dws)} dwords:")
+            for i in range(0, len(dws), 8):
+              print(f"    [{i:3d}]: " + ' '.join(f'{d:08x}' for d in dws[i:i+8]))
+            n_zero = sum(1 for d in dws if d == 0)
+            n_poison = sum(1 for d in dws if d == 0x55555555)
+            print(f"  ring stats: {n_zero}/{len(dws)} zero, {n_poison}/{len(dws)} poison(0x55555555), {len(dws)-n_zero-n_poison} other")
+        except Exception as ex:
+          print(f"  compute ring dump failed: {ex}")
       except Exception as e:
         print(f"  compute_queue dump failed: {e}")
     sq = getattr(self.owner, 'sdma_queue', None)
@@ -97,6 +116,13 @@ class AMDSignal(HCQSignal):
               'regSDMA0_GFX_RB_CNTL', 'regSDMA0_GFX_IB_CNTL', 'regSDMA0_GFX_DOORBELL', 'regSDMA0_GFX_DOORBELL_OFFSET',
               'regSDMA0_GFX_RB_RPTR_ADDR_LO', 'regSDMA0_GFX_RB_RPTR_ADDR_HI',
               'regSDMA0_GFX_RB_WPTR_POLL_ADDR_LO', 'regSDMA0_GFX_RB_WPTR_POLL_ADDR_HI',
+              # Patch 1 verification: these are the registers Linux's sdma_v5_2_gfx_resume_instance
+              # programs that tinygrad was previously skipping on v5.2. If the patch landed, we should
+              # see RB_WPTR_POLL_CNTL bit 0 (F32_POLL_ENABLE) = 1, SDMA0_CNTL.MIDCMD_PREEMPT_ENABLE
+              # set, UTCL1_CNTL with RESP_MODE/REDO_DELAY non-zero, and SEM_WAIT_FAIL_TIMER_CNTL = 0.
+              'regSDMA0_GFX_RB_WPTR_POLL_CNTL', 'regSDMA0_CNTL',
+              'regSDMA0_UTCL1_CNTL', 'regSDMA0_UTCL1_PAGE',
+              'regSDMA0_SEM_WAIT_FAIL_TIMER_CNTL',
               'regSDMA0_F32_CNTL', 'regSDMA0_STATUS_REG', 'regSDMA0_F32_INTERRUPT_CNTL']:
       try:
         if hasattr(adev, r):
@@ -104,6 +130,49 @@ class AMDSignal(HCQSignal):
           print(f"    {r}=0x{val:08x}")
       except Exception as e:
         print(f"    {r}: read failed: {e}")
+    # MMHUB VM CONTEXT0 — SDMA on RDNA2 uses MMHUB for translation (it's a memory engine, not graphics).
+    # If MMVM_CONTEXT0 page table base doesn't match what the host's MemoryManager set up,
+    # SDMA reads VMID 0 → wrong page table → faults. This is the leading hypothesis for the UTCL2 fault.
+    print("  --- MMHUB VM CONTEXT0 (RDNA2 SDMA translation context) ---")
+    for r in ['regMMVM_CONTEXT0_CNTL', 'regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32', 'regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32',
+              'regMMVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32', 'regMMVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32',
+              'regMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32', 'regMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32',
+              'regMMVM_L2_PROTECTION_FAULT_STATUS', 'regMMVM_L2_PROTECTION_FAULT_ADDR_LO32', 'regMMVM_L2_PROTECTION_FAULT_ADDR_HI32',
+              'regMMVM_L2_PROTECTION_FAULT_CNTL', 'regMMVM_INVALIDATE_ENG0_REQ', 'regMMVM_INVALIDATE_ENG0_ACK']:
+      try:
+        if hasattr(adev, r):
+          val = getattr(adev, r).read()
+          print(f"    {r}=0x{val:08x}")
+      except Exception as e:
+        print(f"    {r}: read failed: {e}")
+    # GC VM CONTEXT0 — for comparison; SDMA may also be hitting GC hub even though it's a memory engine
+    print("  --- GC VM CONTEXT0 (graphics translation context) ---")
+    for r in ['regGCVM_CONTEXT0_CNTL', 'regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32', 'regGCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32',
+              'regGCVM_L2_PROTECTION_FAULT_STATUS', 'regGCVM_L2_PROTECTION_FAULT_ADDR_LO32', 'regGCVM_L2_PROTECTION_FAULT_ADDR_HI32',
+              'regGCVM_INVALIDATE_ENG0_REQ', 'regGCVM_INVALIDATE_ENG0_ACK']:
+      try:
+        if hasattr(adev, r):
+          val = getattr(adev, r).read()
+          print(f"    {r}=0x{val:08x}")
+      except Exception as e:
+        print(f"    {r}: read failed: {e}")
+    # Compare MMHUB context0 base against the host MemoryManager's view
+    try:
+      mm_pt_paddr = adev.mm.root_page_table.paddr
+      mm_va_base = adev.mm.va_base
+      print(f"  --- MM expectation: root_page_table.paddr=0x{mm_pt_paddr:x} va_base=0x{mm_va_base:x} ---")
+    except Exception as e:
+      print(f"  MM expectation read failed: {e}")
+    # Host-side ring address from sdma queue object
+    try:
+      sq0 = sq(0) if callable(sq) else None
+      if sq0 is not None and hasattr(sq0, 'ring'):
+        ring_addr = getattr(sq0.ring, 'addr', None)
+        ring_size = getattr(sq0.ring, 'nbytes', None)
+        addr_str = f"0x{ring_addr:x}" if isinstance(ring_addr, int) else str(ring_addr)
+        print(f"  --- host sdma_queue ring: addr={addr_str} size={ring_size} ---")
+    except Exception as e:
+      print(f"  host sdma_queue ring read failed: {e}")
     # Iterate compute queue slots that AM_GFX uses (me=1, pipe=0, queue=0..1) and dump HQD state
     for xcc in range(adev.gfx.xccs):
       for q in range(2):
@@ -155,6 +224,409 @@ class AMDSignal(HCQSignal):
       print(f"  CP_STAT=0x{cp_stat:08x}")
     except Exception as e:
       print(f"  CP_STAT read failed: {e}")
+    # MEC alive/halt/instruction-pointer reads — answers "is the MEC microcode actually running?"
+    # Per the user's tree: ring is full of valid PM4 and HQD looks active, so the next critical
+    # question is whether MEC is even running its microcode loop. If MEC_CNTL has the HALT bit set,
+    # nothing in the queue will ever be processed regardless of how perfect the rest is.
+    print("  --- MEC state (is the microcode running?) ---")
+    # Broadcast-context registers — these are genuinely global per-ME (not per-pipe-instanced)
+    for r in ['regCP_MEC_CNTL', 'regCP_MEC_ME1_HEADER_DUMP', 'regCP_MEC_ME2_HEADER_DUMP',
+              'regCP_CPC_STATUS', 'regCP_CPF_STATUS', 'regCP_CPC_BUSY_STAT', 'regCP_CPF_BUSY_STAT',
+              'regCP_ME_CNTL', 'regCP_INT_CNTL', 'regCP_INT_CNTL_RING0',
+              'regCP_RB_WPTR_POLL_CNTL', 'regRLC_CP_SCHEDULERS']:
+      try:
+        if hasattr(adev, r):
+          val = getattr(adev, r).read()
+          flag = ""
+          if r == 'regCP_MEC_CNTL':
+            me1_halt = (val >> 30) & 1
+            me2_halt = (val >> 28) & 1
+            flag = f"  (ME1_HALT={me1_halt} ME2_HALT={me2_halt})"
+          print(f"    {r}=0x{val:08x}{flag}")
+      except Exception as e:
+        print(f"    {r}: read failed: {e}")
+    # CP_PQ_WPTR_POLL_CNTL/CNTL1 are EMPIRICALLY per-pipe-instanced — broadcast reads return a
+    # different shadow than what we wrote under _grbm_select(me=1, pipe=0, queue=0). Read them
+    # from the same per-pipe context we wrote them under to see the actual MEC-visible value.
+    print("  --- CP_PQ_* (per-pipe context, me=1 pipe=0 queue=0) ---")
+    try:
+      adev.gfx._grbm_select(me=1, pipe=0, queue=0, inst=0)
+      for r in ['regCP_PQ_WPTR_POLL_CNTL', 'regCP_PQ_WPTR_POLL_CNTL1', 'regCP_PQ_STATUS']:
+        try:
+          if hasattr(adev, r):
+            val = getattr(adev, r).read(inst=0)
+            flag = ""
+            if r == 'regCP_PQ_STATUS':
+              dbe = (val >> 1) & 1
+              flag = f"  (DOORBELL_ENABLE={dbe} — must be 1 for CP doorbell→parser routing)"
+            print(f"    {r}=0x{val:08x}{flag}")
+        except Exception as e:
+          print(f"    {r}: read failed: {e}")
+      adev.gfx._grbm_select(inst=0)
+    except Exception as e:
+      print(f"    per-pipe CP_PQ reads failed: {e}")
+    # Per-HQD registers — must select me=1 pipe=0 queue=0 first (the MEC compute queue our queue lives in)
+    try:
+      adev.gfx._grbm_select(me=1, pipe=0, queue=0, inst=0)
+      for r in ['regCP_HQD_HQ_STATUS0', 'regCP_HQD_HQ_CONTROL0', 'regCP_HQD_DEQUEUE_REQUEST',
+                'regCP_HQD_PERSISTENT_STATE', 'regCP_HQD_PIPE_PRIORITY', 'regCP_HQD_QUANTUM',
+                # CSA / context-save registers — leading suspect for the literal VA=0 fault loop.
+                # If MEC has preload_req=1 (or any other context-restore path), it dereferences these
+                # to find the saved context. Unset CSA → reads from VA=0 → MAPPING_ERROR fault loop.
+                'regCP_HQD_CTX_SAVE_BASE_ADDR_LO', 'regCP_HQD_CTX_SAVE_BASE_ADDR_HI',
+                'regCP_HQD_CTX_SAVE_SIZE', 'regCP_HQD_CNTL_STACK_OFFSET', 'regCP_HQD_CNTL_STACK_SIZE',
+                'regCP_HQD_WG_STATE_OFFSET',
+                # Additional context-related registers worth dumping
+                'regCP_HQD_PQ_BASE', 'regCP_HQD_PQ_BASE_HI', 'regCP_HQD_PQ_RPTR',
+                'regCP_HQD_PQ_CONTROL', 'regCP_HQD_IB_BASE_ADDR', 'regCP_HQD_IB_BASE_ADDR_HI',
+                'regCP_HQD_IB_CONTROL', 'regCP_HQD_VMID', 'regCP_HQD_GFX_STATUS',
+                # CP_HQD_EOP_RPTR with INIT_FETCHER (bit 31) is what KFD sets to kick off fetching.
+                'regCP_HQD_EOP_RPTR', 'regCP_HQD_EOP_BASE_ADDR', 'regCP_HQD_EOP_BASE_ADDR_HI',
+                'regCP_HQD_EOP_CONTROL']:
+        try:
+          if hasattr(adev, r):
+            val = getattr(adev, r).read(inst=0)
+            print(f"    {r}=0x{val:08x}  (selected me=1 pipe=0 queue=0)")
+        except Exception as e:
+          pass  # quietly skip registers not present on this ASIC
+      adev.gfx._grbm_select(inst=0)
+    except Exception as e:
+      print(f"    grbm-selected HQD reads failed: {e}")
+    # Read the rptr_report memory and signal memory via cpu_view to see if the parser is making
+    # any progress that the HQD register doesn't reflect, or if the wait-target signal is anywhere
+    # other than zero. cq.read_ptr[0] already maps to the rptr_report memory (same backing).
+    try:
+      if cq is not None and cq.read_ptr is not None:
+        rptr_mem_dwords = [int(cq.read_ptr[i]) if hasattr(cq.read_ptr, '__getitem__') else None for i in range(4)]
+        print(f"  rptr_report memory (host cpu_view): {rptr_mem_dwords}")
+    except Exception as e:
+      print(f"  rptr_report read failed: {e}")
+    # Cache-coherency experiment: explicitly flush HDP (host data path) and invalidate the GFXHUB
+    # TLBs, then re-read RB_RPTR and HQD state to see if anything moved. Linux's gfx_v10/sdma_v5_2
+    # paths flush HDP via the regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL register, and tinygrad's gmc.flush_hdp()
+    # already does this. If a flush+invalidate causes RPTR to advance, we have a cache visibility bug.
+    print("  --- cache-coherency experiment: HDP flush + GFXHUB invalidate, then re-read ---")
+    try:
+      if hasattr(adev, 'gmc') and hasattr(adev.gmc, 'flush_hdp'):
+        adev.gmc.flush_hdp()
+        print(f"    HDP flush issued")
+      if hasattr(adev, 'gmc') and hasattr(adev.gmc, 'flush_tlb'):
+        try:
+          adev.gmc.flush_tlb('GC', vmid=0)
+          print(f"    GC flush_tlb(vmid=0) issued")
+        except Exception as ex:
+          print(f"    GC flush_tlb failed: {ex}")
+      time.sleep(0.5)
+      # Re-read HQD and signal state
+      try:
+        adev.gfx._grbm_select(me=1, pipe=0, queue=0, inst=0)
+        rb_rptr_after = adev.regCP_HQD_PQ_RPTR.read(inst=0)
+        wptr_after = adev.regCP_HQD_PQ_WPTR_LO.read(inst=0)
+        active_after = adev.regCP_HQD_ACTIVE.read(inst=0)
+        adev.gfx._grbm_select(inst=0)
+      except Exception as ex:
+        rb_rptr_after = wptr_after = active_after = -1
+      sig_after = self.base_buf.cpu_view().view(0, 8, 'Q')[0]
+      print(f"    post-flush HQD: ACTIVE=0x{active_after:08x} RPTR=0x{rb_rptr_after:08x} WPTR=0x{wptr_after:08x}  signal=0x{sig_after:x}")
+      if cq is not None and cq.read_ptr is not None:
+        try:
+          host_rptr_after = int(cq.read_ptr[0])
+          print(f"    post-flush host read_ptr[0]={host_rptr_after}")
+        except Exception: pass
+    except Exception as e:
+      print(f"    cache-coherency experiment failed: {e}")
+    # ---------------- DIRECT MMIO WPTR POKE BISECT (oracle directive — bisect, not fix) ----------------
+    # Decision is set in the WPTR PUBLICATION FORK below; this block reads it and acts. We declare the
+    # fork-decision variable up top so the poke block (which logically runs LAST) is structurally
+    # adjacent. Set on the fork: 'doorbell_broken' if host published but GPU never ingested.
+    _wptr_fork_decision = {'kind': None}
+    # ---------------- WPTR PUBLICATION FORK (oracle directive C) ----------------
+    # Linux's sdma_v5_2 producer path updates wptr_cpu_addr (the GPU-DMA-mapped sysmem location the
+    # GPU polls) and rings the doorbell. There is no direct MMIO RB_WPTR fallback for v5.2.0 — only
+    # v5.2.1 has it. So if wptr_cpu_addr stays 0, host submit is broken before SDMA could see it.
+    # If wptr_cpu_addr is nonzero but RB_WPTR/RB_RPTR stay 0, the doorbell/wptr-ingestion path is the
+    # leading suspect. tinygrad's sdma_queue.write_ptr is the MMIOInterface bound to wptr_cpu_addr,
+    # so write_ptr[0] IS the GPU-visible publish value.
+    print("  --- WPTR publication fork ---")
+    try:
+      sq0 = sq(0) if callable(sq) else None
+      if sq0 is not None:
+        host_put = sq0.put_value
+        host_wptr = sq0.write_ptr[0] if sq0.write_ptr is not None else None
+        host_rptr = sq0.read_ptr[0] if sq0.read_ptr is not None else None
+        gpu_rb_rptr = adev.regSDMA0_GFX_RB_RPTR.read() if hasattr(adev, 'regSDMA0_GFX_RB_RPTR') else None
+        gpu_rb_wptr = adev.regSDMA0_GFX_RB_WPTR.read() if hasattr(adev, 'regSDMA0_GFX_RB_WPTR') else None
+        print(f"    host_put={host_put}  wptr_cpu_addr(write_ptr[0])={host_wptr}  rptr_cpu_addr(read_ptr[0])={host_rptr}")
+        print(f"    gpu_RB_WPTR={gpu_rb_wptr}  gpu_RB_RPTR={gpu_rb_rptr}")
+        if host_wptr == 0:
+          print("    => FORK: host submit broken (wptr_cpu_addr never published). Stop thinking about TLBs.")
+          _wptr_fork_decision['kind'] = 'host_broken'
+        elif gpu_rb_wptr == 0 and gpu_rb_rptr == 0:
+          print("    => FORK: doorbell/wptr ingestion broken (host published, GPU never ingested). Inspect doorbell aperture / wptr poll path / GFXHUB visibility.")
+          _wptr_fork_decision['kind'] = 'doorbell_broken'
+          _wptr_fork_decision['host_wptr'] = host_wptr
+        elif gpu_rb_wptr != 0 and gpu_rb_rptr == 0:
+          print("    => FORK: GPU saw wptr but never executed (parser stalled / first cmd faulted).")
+          _wptr_fork_decision['kind'] = 'parser_stalled'
+        else:
+          print(f"    => UNEXPECTED FORK: gpu_wptr={gpu_rb_wptr} gpu_rptr={gpu_rb_rptr}")
+    except Exception as e:
+      print(f"    wptr fork dump failed: {e}")
+    # ---------------- INVALIDATE ENGINE SWEEP (oracle directive B) ----------------
+    # flush_tlb (ip.py:96-99) actually drives ENG17, not ENG0. ENG0 is presumably for some internal
+    # GPU consumer. Sweep all 18 engines so we can see (a) which engines have non-zero REQ that never
+    # got an ACK (stuck invalidate), and (b) whether ENG17 — the one host code drives — completed.
+    print("  --- VM invalidate engine sweep (GCVM + MMVM, ENG0..ENG17) ---")
+    for eng in range(18):
+      for hub in ('GCVM', 'MMVM'):
+        try:
+          rname = f'reg{hub}_INVALIDATE_ENG{eng}_REQ'
+          aname = f'reg{hub}_INVALIDATE_ENG{eng}_ACK'
+          if hasattr(adev, rname) and hasattr(adev, aname):
+            req = getattr(adev, rname).read()
+            ack = getattr(adev, aname).read()
+            if req != 0 or ack != 0 or eng == 17:
+              flag = "  <-- HOST USES THIS" if eng == 17 else ""
+              stuck = "  STUCK!" if req != 0 and ack == 0 else ""
+              print(f"    {hub} ENG{eng}: REQ=0x{req:08x} ACK=0x{ack:08x}{flag}{stuck}")
+        except Exception as e:
+          pass
+    # ---------------- IH RING RAW DUMP (oracle directive A) ----------------
+    # The interrupt_handler() printed one entry already (UTCL2 src=0 ctx=[0x0,0x40,0x0,0x0]) but the
+    # parsed ring_id=153 looks suspicious — likely a field-offset mismatch on RDNA2. Dump the raw 8
+    # dwords of every entry in the IH ring buffer (starting from offset 0 since the ring isn't zeroed
+    # on consume) so we can manually decode the layout. The current rptr/wptr show how many entries
+    # actually fired, but the buffer still holds the data even after consume.
+    print("  --- IH ring raw dump ---")
+    try:
+      ih = getattr(adev, 'ih', None)
+      if ih is not None and hasattr(ih, 'ring_view') and hasattr(ih, 'ring_size'):
+        suf = ih.rings[0][2] if hasattr(ih, 'rings') else ''
+        try:
+          wptr_bf = adev.reg(f"regIH_RB_WPTR{suf}").read_bitfields()
+          rptr = adev.regIH_RB_RPTR.read()
+          print(f"    IH_RB rptr=0x{rptr:x} wptr_offset=0x{wptr_bf['offset']:x} overflow={wptr_bf.get('rb_overflow', '?')}")
+        except Exception as ex:
+          print(f"    IH_RB ptr read failed: {ex}")
+        # Dump the first N entries unconditionally — even consumed ones still have valid data in the
+        # buffer until they get overwritten by future entries. 8 dwords per entry.
+        max_entries = 16
+        ring_view = ih.ring_view
+        ring_dwords = ih.ring_size // 4
+        for i in range(max_entries):
+          base = (i * 8) % ring_dwords
+          try:
+            dws = [ring_view[(base + j) % ring_dwords] for j in range(8)]
+            if all(d == 0 for d in dws): continue  # skip zero entries (unused slots)
+            print(f"    entry[{i}] @dw{base}: " + " ".join(f"{d:08x}" for d in dws))
+          except Exception as ex:
+            print(f"    entry[{i}] read failed: {ex}")
+            break
+      else:
+        print("    no ih.ring_view available")
+    except Exception as e:
+      print(f"  IH raw dump failed: {e}")
+    # Re-read fault status / addr post-IH-drain (the interrupt_handler clears these only on the
+    # UTCL2_FAULT branch, which our entry didn't take — so the latched values should still be valid).
+    try:
+      gc_fs = adev.regGCVM_L2_PROTECTION_FAULT_STATUS.read() if hasattr(adev, 'regGCVM_L2_PROTECTION_FAULT_STATUS') else None
+      gc_fa_lo = adev.regGCVM_L2_PROTECTION_FAULT_ADDR_LO32.read() if hasattr(adev, 'regGCVM_L2_PROTECTION_FAULT_ADDR_LO32') else None
+      gc_fa_hi = adev.regGCVM_L2_PROTECTION_FAULT_ADDR_HI32.read() if hasattr(adev, 'regGCVM_L2_PROTECTION_FAULT_ADDR_HI32') else None
+      if gc_fs is not None:
+        # FAULT_ADDR is stored as VA>>12, so left-shift to get the actual VA (matches ip.py:472)
+        va = ((gc_fa_hi or 0) << 32 | (gc_fa_lo or 0)) << 12
+        print(f"  GCVM fault recap: STATUS=0x{gc_fs:08x} addr(VA<<12)=0x{va:x}  (NOTE: registers latched, not authoritative — IH is)")
+    except Exception as e:
+      print(f"  fault recap failed: {e}")
+    # ---------------- PT WALKS (existing block, retained) ----------------
+    # Per oracle directive: software-walk the page tables for the exact SDMA support VAs (ring base,
+    # wptr poll, rptr WB) and dump the full PDE/PTE chain plus the resolved physical target. The
+    # GCVM_L2_PROTECTION_FAULT_STATUS already says CID=13 (SDMA0), VMID=0, MAPPING_ERROR=1, RW=read.
+    # We need to know which of the three VAs is the unmapped one and at what level the walk dies.
+    print("  --- SDMA support VA page table walks ---")
+    try:
+      from tinygrad.runtime.autogen.am import am as _am
+      def _read_reg(name):
+        try: return getattr(adev, name).read()
+        except Exception: return None
+      rb_base_lo = _read_reg('regSDMA0_GFX_RB_BASE')
+      rb_base_hi = _read_reg('regSDMA0_GFX_RB_BASE_HI')
+      wptr_lo = _read_reg('regSDMA0_GFX_RB_WPTR_POLL_ADDR_LO')
+      wptr_hi = _read_reg('regSDMA0_GFX_RB_WPTR_POLL_ADDR_HI')
+      rptr_lo = _read_reg('regSDMA0_GFX_RB_RPTR_ADDR_LO')
+      rptr_hi = _read_reg('regSDMA0_GFX_RB_RPTR_ADDR_HI')
+      vas = []
+      # RB_BASE is stored as gpu_addr >> 8 (sdma_v5_2 convention), BASE_HI is gpu_addr >> 40.
+      if rb_base_lo is not None and rb_base_hi is not None:
+        vas.append(("ring_base", ((rb_base_hi & 0xFFFFFFFF) << 40) | ((rb_base_lo & 0xFFFFFFFF) << 8)))
+      if wptr_lo is not None and wptr_hi is not None:
+        vas.append(("wptr_poll", ((wptr_hi & 0xFFFFFFFF) << 32) | (wptr_lo & 0xFFFFFFFF)))
+      if rptr_lo is not None and rptr_hi is not None:
+        vas.append(("rptr_wb",   ((rptr_hi & 0xFFFFFFFF) << 32) | (rptr_lo & 0xFFFFFFFF)))
+      mm = adev.mm
+      for label, va in vas:
+        print(f"  >> {label} va=0x{va:x}")
+        if va == 0:
+          print(f"     (zero — not programmed)")
+          continue
+        if va < mm.va_base:
+          print(f"     va < mm.va_base (0x{mm.va_base:x}); not in GPUVM range — would translate via aperture, not page tables")
+          continue
+        rel = va - mm.va_base
+        pt = mm.root_page_table
+        depth = 0
+        while True:
+          try:
+            pte_size = mm.pte_covers[pt.lv]
+            pte_cnt = mm.pte_cnt[pt.lv]
+          except Exception as ex:
+            print(f"     L{depth} lv={pt.lv}: pte_covers/pte_cnt lookup failed: {ex}")
+            break
+          idx = (rel // pte_size) % pte_cnt
+          try:
+            raw = pt.entry(idx)
+            valid = pt.valid(idx)
+            is_page = pt.is_page(idx)
+          except Exception as ex:
+            print(f"     L{depth} lv={pt.lv} pt.paddr=0x{pt.paddr:x} idx={idx}: entry read failed: {ex}")
+            break
+          print(f"     L{depth} lv={pt.lv} pt.paddr=0x{pt.paddr:x} idx={idx} pte_covers=0x{pte_size:x} entry=0x{raw:016x} valid={valid} is_page={is_page}")
+          if not valid:
+            print(f"     -> STOPPED at level {depth}: PTE not valid (this VA is unmapped)")
+            break
+          if is_page:
+            try:
+              leaf_paddr = pt.address(idx)
+              page_off = rel & (pte_size - 1)
+              final = leaf_paddr + page_off
+              is_sys = bool(raw & _am.AMDGPU_PTE_SYSTEM) if hasattr(_am, 'AMDGPU_PTE_SYSTEM') else False
+              aspace_str = 'SYS (dext-DMA-backed sysmem)' if is_sys else 'VRAM/local palloc'
+              print(f"     -> LEAF: physical=0x{leaf_paddr:x} + page_off=0x{page_off:x} = 0x{final:x}  aspace={aspace_str}")
+            except Exception as ex:
+              print(f"     -> leaf resolve failed: {ex}")
+            break
+          # Descend to child page table.
+          try:
+            child_paddr = pt.address(idx)
+            pt = mm.pt_t(adev, child_paddr, lv=pt.lv+1)
+          except Exception as ex:
+            print(f"     -> descend failed: {ex}")
+            break
+          depth += 1
+          if depth > 8:
+            print(f"     -> STOPPED: depth limit (>8 levels)")
+            break
+    except Exception as e:
+      print(f"  PT walk block failed: {e}")
+    # ---------------- THREE-STEP SDMA INGESTION BISECT (β → γ → α) ----------------
+    # Previous run's plain MMIO poke was not decisive: with DOORBELL.ENABLE=1 and wptr_poll_enable=0
+    # (RDNA2 default in tinygrad — `needs_wptr_poll` only sets it for ip_ver[0]>=6), the queue is in
+    # doorbell-only mode. A register write to RB_WPTR can be accepted by the register file and still
+    # be ignored by the consumer path. We need three sub-bisects to discriminate cleanly.
+    #
+    #   β: disable doorbell + MMIO poke RB_WPTR. Tests "can engine consume work at all if freed from
+    #      doorbell-only mode?" — independent of host sysmem reachability.
+    #   γ: enable wptr_poll_enable in RB_CNTL. SDMA should now poll wptr_cpu_addr (already 76).
+    #      Tests "is host sysmem visible to SDMA via the polling path?"
+    #   α: ring the doorbell directly from diag. Tests "does the doorbell aperture route at all?"
+    #
+    # Run them in order and bail on the first one that moves RB_RPTR.
+    if _wptr_fork_decision.get('kind') == 'doorbell_broken':
+      print("  --- THREE-STEP SDMA BISECT (β/γ/α) ---")
+      sig_buf = self.base_buf.cpu_view().view(0, 8, 'Q')
+      host_wptr = _wptr_fork_decision['host_wptr']
+      def _poll_for_movement(label, timeout_s=2.0):
+        """Poll RB_RPTR/signal for up to timeout_s. Returns (moved, rb_wptr, rb_rptr, sig)."""
+        steps = int(timeout_s * 10)
+        for i in range(steps):
+          time.sleep(0.1)
+          rb_rptr = adev.regSDMA0_GFX_RB_RPTR.read()
+          sig_now = sig_buf[0]
+          if rb_rptr != 0 or sig_now != 0:
+            rb_wptr = adev.regSDMA0_GFX_RB_WPTR.read()
+            print(f"    [{label}] poll[{(i+1)*100}ms]: RB_WPTR=0x{rb_wptr:08x} RB_RPTR=0x{rb_rptr:08x} signal=0x{sig_now:x}  <-- MOVEMENT")
+            return True, rb_wptr, rb_rptr, sig_now
+        rb_wptr = adev.regSDMA0_GFX_RB_WPTR.read()
+        rb_rptr = adev.regSDMA0_GFX_RB_RPTR.read()
+        sig_now = sig_buf[0]
+        status = adev.regSDMA0_STATUS_REG.read() if hasattr(adev, 'regSDMA0_STATUS_REG') else 0
+        print(f"    [{label}] post ({timeout_s}s): RB_WPTR=0x{rb_wptr:08x} RB_RPTR=0x{rb_rptr:08x} signal=0x{sig_now:x} STATUS=0x{status:08x}")
+        return False, rb_wptr, rb_rptr, sig_now
+
+      moved = False
+      verdict = None
+      try:
+        # ===== β: disable doorbell, MMIO poke =====
+        print("  --- β: disable doorbell + MMIO RB_WPTR poke ---")
+        try:
+          db_orig = adev.regSDMA0_GFX_DOORBELL.read()
+          print(f"    DOORBELL pre=0x{db_orig:08x} (bit28 ENABLE={'set' if db_orig & 0x10000000 else 'clear'})")
+          # Clear bit 28 (ENABLE) and bit 31 (CAPTURED if present), keep all other bits.
+          adev.regSDMA0_GFX_DOORBELL.write(db_orig & ~0x10000000)
+          db_now = adev.regSDMA0_GFX_DOORBELL.read()
+          print(f"    DOORBELL post-clear=0x{db_now:08x}")
+          # Re-poke RB_WPTR to make sure the reg has the right value
+          adev.regSDMA0_GFX_RB_WPTR.write(host_wptr & 0xFFFFFFFF)
+          adev.regSDMA0_GFX_RB_WPTR_HI.write((host_wptr >> 32) & 0xFFFFFFFF)
+          print(f"    poked RB_WPTR=0x{host_wptr & 0xFFFFFFFF:08x}")
+          moved, _, _, _ = _poll_for_movement("β")
+          if moved:
+            verdict = "β: SDMA consumes once doorbell-only mode is disabled. Engine is alive. Bug is in DOORBELL DELIVERY/PATH."
+          # Restore doorbell enable so subsequent steps see consistent state
+          adev.regSDMA0_GFX_DOORBELL.write(db_orig)
+        except Exception as e:
+          print(f"    β failed: {e}")
+
+        # ===== γ: enable wptr_poll_enable =====
+        if not moved:
+          print("  --- γ: enable wptr_poll_enable in SDMA0_GFX_RB_CNTL ---")
+          try:
+            rb_cntl_orig = adev.regSDMA0_GFX_RB_CNTL.read()
+            print(f"    RB_CNTL pre=0x{rb_cntl_orig:08x}")
+            # Try field-name update first; the field is named per setup_ring: '{sdma_name.lower()}_wptr_poll_enable'
+            try:
+              adev.regSDMA0_GFX_RB_CNTL.update(sdma0_wptr_poll_enable=1)
+              method = "field update"
+            except Exception:
+              # Fallback: in sdma_v5_2 SH_MASK, SDMA0_GFX_RB_CNTL__SDMA0_WPTR_POLL_ENABLE is bit 13.
+              # If that's wrong we'll see no movement and can refine.
+              adev.regSDMA0_GFX_RB_CNTL.write(rb_cntl_orig | (1 << 13))
+              method = "raw bit13"
+            rb_cntl_now = adev.regSDMA0_GFX_RB_CNTL.read()
+            print(f"    RB_CNTL post={rb_cntl_now:#010x} (via {method}, delta=0x{rb_cntl_orig ^ rb_cntl_now:08x})")
+            # wptr_cpu_addr already holds 76 from the original submit. SDMA should now poll it.
+            moved, _, _, _ = _poll_for_movement("γ", timeout_s=3.0)
+            if moved:
+              verdict = "γ: SDMA consumes via wptr poll path. Host sysmem IS visible to SDMA. Bug is specifically DOORBELL MODE/DELIVERY."
+            # Restore RB_CNTL to its original value
+            adev.regSDMA0_GFX_RB_CNTL.write(rb_cntl_orig)
+          except Exception as e:
+            print(f"    γ failed: {e}")
+
+        # ===== α: ring the doorbell directly from diag =====
+        if not moved:
+          print("  --- α: ring doorbell from diagnostic ---")
+          try:
+            sq0 = sq(0) if callable(sq) else None
+            db = getattr(sq0, 'doorbell', None) if sq0 is not None else None
+            if db is None:
+              print(f"    no doorbell MMIOInterface on sdma_queue")
+            else:
+              print(f"    ringing doorbell with value={host_wptr}")
+              db[0] = host_wptr
+              moved, _, _, _ = _poll_for_movement("α", timeout_s=2.0)
+              if moved:
+                verdict = "α: SDMA consumes when doorbell is rung from diag. Original submit's doorbell write was racing/skipped. Bug is in submit-time doorbell sequence/timing."
+          except Exception as e:
+            print(f"    α failed: {e}")
+
+        # ===== Final verdict =====
+        if verdict:
+          print(f"  ===> BISECT VERDICT: {verdict}")
+        else:
+          print(f"  ===> BISECT VERDICT: ALL THREE FAILED. SDMA engine itself is not consuming. Escalate to: (1) VRAM-backed queue support memory test, (2) SDMA enable/init state, (3) dext IODMACommand sysmem reachability.")
+      except Exception as e:
+        print(f"    bisect block failed: {e}")
     print(f"--- end diagnostics ---")
 
 class AMDComputeQueue(HWQueue):
@@ -463,7 +935,11 @@ class AMDComputeQueue(HWQueue):
           scratch_base = prg.dev.scratch.va_addr + (prg.dev.scratch.size // self.dev.xccs * xcc_id)
           self.wreg(self.gc.regCOMPUTE_DISPATCH_SCRATCH_BASE_LO, *data64_le(scratch_base >> 8))
 
-    if (10,0,0) <= prg.dev.target < (11,0,0): self.wreg(self.gc.mmCP_COHER_START_DELAY, 0x20)
+    # CP_COHER_START_DELAY is a coherence delay tuning register present on gfx10.1 (Navi 1x) but
+    # absent on gfx10.3 (Navi 2x / Sienna Cichlid). The autogen header for GC 10.3.0 doesn't expose
+    # it, so guard the write on whether the register exists. It's a perf hint, not load-bearing.
+    if (10,0,0) <= prg.dev.target < (11,0,0) and 'mmCP_COHER_START_DELAY' in self.gc.__dict__:
+      self.wreg(self.gc.mmCP_COHER_START_DELAY, 0x20)
 
     self.wreg(self.gc.regCOMPUTE_RESTART_X, 0, 0, 0)
     self.wreg(self.gc.regCOMPUTE_USER_DATA_0, *user_regs)
@@ -753,6 +1229,13 @@ class AMDAllocator(HCQAllocator['AMDDevice']):
                      supports_copy_from_disk=dev.has_sdma_queue, supports_transfer=dev.has_sdma_queue)
 
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer:
+    # AMD_QUEUE_VRAM=1 sledgehammer: route ALL allocations to VRAM-backed memory via force_devmem=True
+    # and override host=False, ensuring nothing lives in sysmem. This is the structural bisect for the
+    # dext sysmem DMA reachability hypothesis. The override applies to signal pool, kernel binary,
+    # tensor buffers — everything. Requires resizable BAR (which we already have on Sienna Cichlid).
+    # If queues start consuming under this gate, the dext sysmem path is provably the blocker.
+    if getenv("AMD_QUEUE_VRAM", 0):
+      return self.dev.iface.alloc(size, host=False, uncached=options.uncached, cpu_access=True, force_devmem=True)
     return self.dev.iface.alloc(size, host=options.host, uncached=options.uncached, cpu_access=options.cpu_access or not self.dev.has_sdma_queue)
 
   def _do_free(self, opaque, options:BufferSpec): self.dev.iface.free(opaque)
@@ -1123,8 +1606,18 @@ class AMDDevice(HCQCompiled):
       self.sqtt_next_cmd_id = itertools.count(0)
 
   def create_queue(self, queue_type, ring_size, ctx_save_restore_size=0, eop_buffer_size=0, ctl_stack_size=0, debug_memory_size=0, idx=0):
-    ring = self.iface.alloc(ring_size, uncached=True, cpu_access=True)
-    gart = self.iface.alloc(0x100, uncached=True, cpu_access=True)
+    # AMD_QUEUE_VRAM=1: place all queue support objects (ring, gart/rptr/wptr storage, EOP, CWSR) in
+    # VRAM-backed memory via force_devmem=True instead of the default sysmem-backed path. This is a
+    # diagnostic/bisect for the dext sysmem DMA reachability hypothesis on macOS RDNA2 — both compute
+    # and SDMA queues currently fail with the host-published wptr never being consumed by the GPU,
+    # which is consistent with sysmem pages being unreachable from the GPU even though their PTEs
+    # walk cleanly. If queues consume work under AMD_QUEUE_VRAM=1, the dext sysmem path is provably
+    # the blocker. The path still uses GPUVMA addressing — only the backing memory changes from
+    # sysmem (host RAM via PCIe DMA) to VRAM (GPU local memory accessed via BAR aperture).
+    _qvram = bool(getenv("AMD_QUEUE_VRAM", 0))
+    _qkw = {"force_devmem": True} if _qvram else {}
+    ring = self.iface.alloc(ring_size, uncached=True, cpu_access=True, **_qkw)
+    gart = self.iface.alloc(0x100, uncached=True, cpu_access=True, **_qkw)
 
     if queue_type == kfd.KFD_IOC_QUEUE_TYPE_COMPUTE_AQL:
       self.aql_gart = gart
@@ -1134,8 +1627,8 @@ class AMDDevice(HCQCompiled):
       self.aql_gart.cpu_view().view(fmt='B')[:ctypes.sizeof(self.aql_desc)] = bytes(self.aql_desc)
 
     cwsr_buffer_size = round_up((ctx_save_restore_size + debug_memory_size) * self.xccs, mmap.PAGESIZE)
-    cwsr_buffer = self.iface.alloc(cwsr_buffer_size) if ctx_save_restore_size else None
-    eop_buffer = self.iface.alloc(eop_buffer_size) if eop_buffer_size else None
+    cwsr_buffer = self.iface.alloc(cwsr_buffer_size, **_qkw) if ctx_save_restore_size else None
+    eop_buffer = self.iface.alloc(eop_buffer_size, **_qkw) if eop_buffer_size else None
 
     return (self.iface.create_queue(queue_type, ring, gart, rptr=getattr(hsa.amd_queue_t, 'read_dispatch_id').offset,
             wptr=getattr(hsa.amd_queue_t, 'write_dispatch_id').offset, eop_buffer=eop_buffer, cwsr_buffer=cwsr_buffer,

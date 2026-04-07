@@ -1,6 +1,6 @@
 import ctypes, time, contextlib, functools
 from typing import cast, Literal
-from tinygrad.helpers import to_mv, data64, lo32, hi32, DEBUG, wait_cond, pad_bytes, getbits
+from tinygrad.helpers import to_mv, data64, lo32, hi32, DEBUG, wait_cond, pad_bytes, getbits, getenv
 from tinygrad.runtime.autogen.am import am
 from tinygrad.runtime.support.amd import import_soc
 from tinygrad.runtime.support.memory import AddrSpace
@@ -238,11 +238,23 @@ class AM_GFX(AM_IP):
     self.xccs = len(self.adev.regs_offset[am.GC_HWIP])
     self.mqd_paddr = [self.adev.mm.palloc(0x1000 * self.xccs, zero=False, boot=True) for i in range(2)]
     self.mqd_mc = [self.adev.paddr2mc(mqd_paddr) for mqd_paddr in self.mqd_paddr]
+    # KIQ bootstrap (gfx10 only): allocate KIQ MQD here in init_sw via boot palloc. Ring and meta
+    # regions are deferred to _setup_kiq() because they need GPUVMA-backed valloc (which requires
+    # is_booting=False). The MQD itself is fine with palloc+paddr2mc because MEC's MQD load uses
+    # a different code path that accepts MC addresses, but the ring is fetched via the queue's
+    # vmid translation which only works with GPUVMA addresses in vmid 0's mapped range.
+    if self.adev.ip_ver[am.GC_HWIP][0] >= 10:
+      self.kiq_mqd_paddr = self.adev.mm.palloc(0x1000, zero=True, boot=True)
+      self.kiq_setup_done = False
+      self.kiq_host_wptr_dws = 0  # internal counter in dwords
 
   def init_hw(self):
-    # Wait for RLC autoload to complete
-    wait_cond(lambda: self.adev.regCP_STAT.read() == 0 or self.adev.regRLC_RLCS_BOOTLOAD_STATUS.read_bitfields()['bootload_complete'] == 0,
-              value=True, msg="RLC autoload timeout")
+    # Wait for RLC autoload to complete. Linux's gfx_v10_0_wait_for_rlc_autoload waits for
+    # CP_STAT == 0 AND BOOTLOAD_COMPLETE == 1. Only run on autoload-supported gens (GFX11+);
+    # RDNA2 doesn't kick autoload, so bootload_complete stays 0 forever.
+    if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0):
+      wait_cond(lambda: self.adev.regCP_STAT.read() == 0 and self.adev.regRLC_RLCS_BOOTLOAD_STATUS.read_bitfields()['bootload_complete'] == 1,
+                value=True, msg="RLC autoload timeout")
 
     self.adev.gmc.init_hub("GC", inst_cnt=self.xccs)
     if self.adev.partial_boot: return self.reset_mec()
@@ -292,6 +304,177 @@ class AM_GFX(AM_IP):
     # Set 1 partition
     if self.xccs > 1: self.adev.psp._spatial_partition_cmd(1)
 
+    # KIQ bootstrap (gfx10 only). Must run after _enable_mec so MEC microcode is unhalted.
+    # AMD_KIQ_BOOTSTRAP=1 enables; default OFF while we bisect a regression where MEC1 firmware
+    # appears unloaded (HEADER_DUMP=0xdef0def0) regardless of whether _setup_kiq runs.
+    if self.adev.ip_ver[am.GC_HWIP][0] >= 10 and not self.adev.partial_boot and getenv("AMD_KIQ_BOOTSTRAP", 0):
+      try: self._setup_kiq()
+      except Exception as e: print(f"am {self.adev.devfmt}: KIQ setup failed: {e}")
+
+  def _setup_kiq(self):
+    """Set up a minimal KIQ on me=1/pipe=2/queue=0 to bootstrap MEC's compute scheduler.
+
+    The KIQ is the boot-time control queue that MEC processes unconditionally once
+    RLC_CP_SCHEDULERS.scheduler0 is set with its location and the enable bit. We use it
+    to submit SET_RESOURCES + MAP_QUEUES PM4 packets that enable normal compute queues.
+
+    Without this, MEC's main scheduling loop never starts on the AM driver path because
+    nothing kicks it (KFD's HQD-direct path on Linux relies on amdgpu's KIQ activation
+    having already done that bootstrap).
+
+    KIQ placement: me=1, pipe=2, queue=0 — a separate MEC1 pipe slot from our compute
+    queue at me=1/pipe=0/queue=0. The MEC2-on-me=2 standard placement requires loading
+    mec2.bin via PSP, which broke MEC1 loading on first attempt — reverted for now to
+    bisect the MAP_QUEUES KCQ activation in isolation.
+    """
+    self.kiq_me, self.kiq_pipe, self.kiq_queue = 1, 2, 0
+    self.kiq_doorbell_idx = am.AMDGPU_NAVI10_DOORBELL_KIQ
+    self.kiq_mqd_mc = self.adev.paddr2mc(self.kiq_mqd_paddr)
+    # Allocate the KIQ ring buffer via valloc — gives a GPUVMA address (in mm.va_base range)
+    # that vmid 0 can translate to VRAM physical. Then map_bar the same physical region for host
+    # CPU access. This matches what PCIIfaceBase.alloc does for force_devmem=True buffers.
+    self.kiq_ring_size = 0x1000  # 4 KB ring (1024 dwords)
+    _ring_mapping = self.adev.mm.valloc(self.kiq_ring_size, uncached=True, contiguous=True)
+    self.kiq_ring_va = _ring_mapping.va_addr
+    _ring_paddr = _ring_mapping.paddrs[0][0]
+    self.kiq_ring_view = self.adev.pci_dev.map_bar(bar=0, off=_ring_paddr, size=self.kiq_ring_size, fmt='I')
+    # Allocate the KIQ meta region (rptr_report at offset 0, wptr_poll at offset 8 — both 64-bit)
+    _meta_mapping = self.adev.mm.valloc(0x1000, uncached=True, contiguous=True)
+    self.kiq_meta_va = _meta_mapping.va_addr
+    _meta_paddr = _meta_mapping.paddrs[0][0]
+    self.kiq_meta_view = self.adev.pci_dev.map_bar(bar=0, off=_meta_paddr, size=0x1000, fmt='Q')
+    self.kiq_rptr_addr = self.kiq_meta_va + 0x00
+    self.kiq_wptr_addr = self.kiq_meta_va + 0x08
+    print(f"am {self.adev.devfmt}: KIQ ring va=0x{self.kiq_ring_va:x} paddr=0x{_ring_paddr:x}; meta va=0x{self.kiq_meta_va:x} paddr=0x{_meta_paddr:x}")
+
+    # Build the KIQ MQD struct (compute MQD shape, KIQ-specific values)
+    struct_t = getattr(am, f"struct_v{self.adev.ip_ver[am.GC_HWIP][0]}_compute_mqd")
+    mqd = struct_t(header=0xC0310800,
+      compute_pipelinestat_enable=1, compute_misc_reserved=3,
+      cp_mqd_base_addr_lo=lo32(self.kiq_mqd_mc), cp_mqd_base_addr_hi=hi32(self.kiq_mqd_mc),
+      cp_hqd_pipe_priority=2, cp_hqd_queue_priority=0xf, cp_hqd_quantum=0x111,
+      cp_hqd_persistent_state=self.adev.regCP_HQD_PERSISTENT_STATE.encode(preload_size=0x55, preload_req=1),
+      # GPUVMA addresses (not MC) — fix for first-attempt failure where MC addresses for the ring
+      # didn't translate through vmid 0 and MEC silently couldn't fetch from the ring.
+      cp_hqd_pq_base_lo=lo32(self.kiq_ring_va >> 8), cp_hqd_pq_base_hi=hi32(self.kiq_ring_va >> 8),
+      cp_hqd_pq_rptr_report_addr_lo=lo32(self.kiq_rptr_addr), cp_hqd_pq_rptr_report_addr_hi=hi32(self.kiq_rptr_addr),
+      cp_hqd_pq_wptr_poll_addr_lo=lo32(self.kiq_wptr_addr), cp_hqd_pq_wptr_poll_addr_hi=hi32(self.kiq_wptr_addr),
+      cp_hqd_pq_doorbell_control=self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.encode(doorbell_offset=self.kiq_doorbell_idx*2, doorbell_en=1),
+      cp_hqd_pq_control=self.adev.regCP_HQD_PQ_CONTROL.encode(rptr_block_size=5, unord_dispatch=0,
+        queue_size=(self.kiq_ring_size//4).bit_length()-2),
+      cp_hqd_ib_control=self.adev.regCP_HQD_IB_CONTROL.encode(min_ib_avail_size=0x3),
+      cp_hqd_hq_status0=0x20004000,
+      cp_mqd_control=self.adev.regCP_MQD_CONTROL.encode(priv_state=1),
+      cp_hqd_vmid=0, cp_hqd_aql_control=0)
+    for se in range(8): setattr(mqd, f'compute_static_thread_mgmt_se{se}', 0xffffffff)
+    self.adev.vram.view(self.kiq_mqd_paddr, ctypes.sizeof(mqd))[:] = memoryview(mqd).cast('B')
+
+    # Set RLC_CP_SCHEDULERS.scheduler0 (bits 0:7) to point at the KIQ.
+    # Linux's gfx_v10_0_kiq_setting writes (me<<5)|(pipe<<3)|queue|0x80 in scheduler0.
+    sched0 = ((self.kiq_me & 0x7) << 5) | ((self.kiq_pipe & 0x3) << 3) | (self.kiq_queue & 0x7) | 0x80
+    cur = self.adev.regRLC_CP_SCHEDULERS.read()
+    new = (cur & 0xffffff00) | sched0
+    self.adev.regRLC_CP_SCHEDULERS.write(new)
+    print(f"am {self.adev.devfmt}: KIQ scheduler0 set: pre=0x{cur:08x} new=0x{new:08x} (me={self.kiq_me} pipe={self.kiq_pipe} queue={self.kiq_queue})")
+
+    # Activate KIQ HQD via direct register writes (same path as compute setup_ring)
+    self._grbm_select(me=self.kiq_me, pipe=self.kiq_pipe, queue=self.kiq_queue, inst=0)
+    mqd_st_mv = to_mv(ctypes.addressof(mqd), ctypes.sizeof(mqd)).cast('I')
+    for i, reg in enumerate(range(self.adev.regCP_MQD_BASE_ADDR.addr[0], self.adev.regCP_HQD_PQ_WPTR_HI.addr[0] + 1)):
+      self.adev.wreg(reg, mqd_st_mv[0x80 + i])
+
+    # KFD-parity activation tail
+    self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.update(doorbell_en=1, doorbell_offset=self.kiq_doorbell_idx*2)
+    try: self.adev.regCP_PQ_WPTR_POLL_CNTL1.write(1 << (self.kiq_pipe * 8 + self.kiq_queue))
+    except Exception: pass
+    try: self.adev.regCP_HQD_EOP_RPTR.update(init_fetcher=1)
+    except Exception:
+      try: self.adev.regCP_HQD_EOP_RPTR.write(0x80000000)
+      except Exception: pass
+    self.adev.regCP_HQD_ACTIVE.write(0x1)
+    try: self.adev.regCP_PQ_STATUS.update(doorbell_enable=1)
+    except Exception: pass
+    self.adev.gmc.flush_hdp()
+    self._grbm_select(inst=0)
+    self.kiq_setup_done = True
+    print(f"am {self.adev.devfmt}: KIQ HQD activated (ring va=0x{self.kiq_ring_va:x}, mqd mc=0x{self.kiq_mqd_mc:x}, doorbell idx {self.kiq_doorbell_idx})")
+
+    # Submit a SET_RESOURCES packet to the KIQ as a smoke test that MEC is consuming the KIQ ring.
+    # The queue mask covers all possible compute queues (0xffffffff for the low half).
+    self._kiq_set_resources(0xffffffff)
+    time.sleep(0.1)
+    # Read back KIQ state to see if it consumed the packet
+    self._grbm_select(me=self.kiq_me, pipe=self.kiq_pipe, queue=self.kiq_queue, inst=0)
+    kiq_rptr = self.adev.regCP_HQD_PQ_RPTR.read()
+    kiq_wptr = self.adev.regCP_HQD_PQ_WPTR_LO.read()
+    kiq_active = self.adev.regCP_HQD_ACTIVE.read()
+    self._grbm_select(inst=0)
+    print(f"am {self.adev.devfmt}: KIQ post-SET_RESOURCES: ACTIVE=0x{kiq_active:x} RPTR=0x{kiq_rptr:x} WPTR=0x{kiq_wptr:x} (host_wptr_bytes={self.kiq_host_wptr_dws*4})")
+
+  def _kiq_submit_packets(self, dwords):
+    """Write PM4 dwords into the KIQ ring buffer and ring the KIQ doorbell.
+
+    Linux convention (per gfx_v10_0_ring_set_wptr_compute, kgd_hqd_load, etc.):
+      - host wptr counter is in DWORDS internally
+      - wptr poll memory and doorbell value are in BYTES (= dwords << 2)
+    First-attempt sent dwords to both, which the GPU treated as bytes — meaning
+    only 25% of the actual dword count was published. Fixed here.
+    """
+    n = len(dwords)
+    ring_dws = self.kiq_ring_size // 4
+    start = self.kiq_host_wptr_dws % ring_dws
+    if start + n > ring_dws:
+      raise RuntimeError(f"KIQ ring would wrap (start={start} n={n} ring_dws={ring_dws}); not supported in bootstrap")
+    for i, dw in enumerate(dwords):
+      self.kiq_ring_view[start + i] = dw
+    self.kiq_host_wptr_dws += n
+    wptr_bytes = self.kiq_host_wptr_dws * 4
+    # Update wptr poll memory in BYTES (host writes via BAR-mapped VRAM at meta + 0x08)
+    self.kiq_meta_view[1] = wptr_bytes  # element 1 of the Q-formatted view = offset 8 (wptr slot)
+    self.adev.gmc.flush_hdp()
+    # Ring the KIQ doorbell in BYTES (BAR2 doorbell aperture, 64-bit write at index*8)
+    self.adev.doorbell64.view(self.kiq_doorbell_idx * 8, 8, fmt='Q')[0] = wptr_bytes
+
+  def _kiq_set_resources(self, queue_mask):
+    """SET_RESOURCES PM4 packet on the KIQ ring. Linux gfx10_kiq_set_resources, 8 dwords."""
+    PACKET3_SET_RESOURCES = 0xA0
+    header = (3 << 30) | ((PACKET3_SET_RESOURCES & 0xff) << 8) | ((6 & 0x3fff) << 16)
+    dwords = [
+      header,
+      (0 << 0) | (0 << 29),  # vmid_mask=0, queue_type=0 (KIQ)
+      queue_mask & 0xffffffff,
+      (queue_mask >> 32) & 0xffffffff,
+      0, 0,  # cleaner shader addr lo/hi (none)
+      0,     # oac mask
+      0,     # gds heap base/size
+    ]
+    self._kiq_submit_packets(dwords)
+
+  def _kiq_map_queues(self, ring_me, ring_pipe, ring_queue, doorbell_idx, mqd_addr, wptr_addr):
+    """MAP_QUEUES PM4 packet on the KIQ ring. Linux gfx10_kiq_map_queues, 7 dwords."""
+    PACKET3_MAP_QUEUES = 0xA2
+    header = (3 << 30) | ((PACKET3_MAP_QUEUES & 0xff) << 8) | ((5 & 0x3fff) << 16)
+    me_field = 0 if ring_me == 1 else 1
+    info = ((0 << 4) |     # QUEUE_SEL = 0 (PI mode)
+            (0 << 8) |     # VMID = 0
+            ((ring_queue & 0x7) << 13) |
+            ((ring_pipe & 0x3) << 16) |
+            ((me_field & 0x3) << 18) |
+            (0 << 21) |    # QUEUE_TYPE = normal compute
+            (0 << 24) |    # ALLOC_FORMAT = all_on_one_pipe
+            (0 << 26) |    # ENGINE_SEL = compute
+            (1 << 29))     # NUM_QUEUES = 1
+    dwords = [
+      header,
+      info,
+      doorbell_idx << 2,  # PACKET3_MAP_QUEUES_DOORBELL_OFFSET shift = 2
+      mqd_addr & 0xffffffff,
+      (mqd_addr >> 32) & 0xffffffff,
+      wptr_addr & 0xffffffff,
+      (wptr_addr >> 32) & 0xffffffff,
+    ]
+    self._kiq_submit_packets(dwords)
+
   def fini_hw(self): self._dequeue_hqds()
 
   def reset_mec(self):
@@ -307,12 +490,60 @@ class AM_GFX(AM_IP):
   def setup_ring(self, ring_addr:int, ring_size:int, rptr_addr:int, wptr_addr:int, eop_addr:int, eop_size:int, idx:int, aql:bool) -> int:
     pipe, queue, doorbell = idx // 4, idx % 4, am.AMDGPU_NAVI10_DOORBELL_MEC_RING0
 
+    # ARCHITECTURAL SHIFT: Linux gfx_v10_0_kcq_init_queue does NOT directly write HQD registers
+    # for KCQs. KCQs only get an MQD built in memory, then activated via MAP_QUEUES PM4 packet
+    # submitted through a working KIQ ring. The direct-register-write path tinygrad has been
+    # using is the KIQ activation pattern applied to a KCQ — wrong for KCQs on gfx10.
+    #
+    # AMD_KCQ_DIRECT_HQD=1 (debug env): keep the old direct-register-write activation as a
+    # fallback for A/B testing while we get the KIQ MAP_QUEUES path working. Default is the
+    # MAP_QUEUES path. Setting AMD_KCQ_DIRECT_HQD=1 reverts to the old behavior.
+    _kcq_direct_hqd = bool(getenv("AMD_KCQ_DIRECT_HQD", 0))
+
+    # RLC_CP_SCHEDULERS scheduler1 (HIQ slot): KFD's hqd_load_v10_3 has a special case for
+    # cp_hqd_vmid==0 queues — it treats them as HIQ (Hardware Interface Queue) and writes
+    # RLC_CP_SCHEDULERS.scheduler1 (bits 8:15) with (mec<<5)|(pipe<<3)|queue|0x80. The scheduler1
+    # slot is the boot-time interface queue that MEC processes unconditionally, without needing
+    # KIQ MAP_QUEUES. We were previously writing scheduler0 (bits 0:7), which is the wrong slot.
+    # KFD source: drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gfx_v10_3.c::hqd_load_v10_3 line 195-205
+    #   if (m->cp_hqd_vmid == 0) {
+    #     value = REG_SET_FIELD(value, RLC_CP_SCHEDULERS, scheduler1,
+    #             ((mec << 5) | (pipe << 3) | queue_id | 0x80));
+    #     WREG32_SOC15(GC, 0, mmRLC_CP_SCHEDULERS, value);
+    #   }
+    # Our compute queue is at me=1, pipe=0, queue=0, vmid=0 → scheduler1 byte = 0xa0.
+    if self.adev.ip_ver[am.GC_HWIP][0] >= 10 and not aql:
+      try:
+        # KFD's mec computation: mec = (pipe_id / num_pipe_per_mec) + 1.
+        # For our compute queue (pipe_id=0, num_pipe_per_mec=4): mec = 1.
+        # Note: tinygrad's `pipe` variable here is the local pipe (idx//4), not pipe_id.
+        # me_field = mec from KFD = our self.me (=1 for compute).
+        _mec_field = 1  # we always use me=1 for compute queues
+        _sched = ((_mec_field & 0x7) << 5) | ((pipe & 0x3) << 3) | (queue & 0x7) | 0x80
+        _cur = self.adev.regRLC_CP_SCHEDULERS.read()
+        # Set bits 8:15 (scheduler1), preserving the rest. KFD uses REG_SET_FIELD.
+        _new = (_cur & ~0x0000ff00) | (_sched << 8)
+        self.adev.regRLC_CP_SCHEDULERS.write(_new)
+        _rb = self.adev.regRLC_CP_SCHEDULERS.read()
+        print(f"am {self.adev.devfmt}: RLC_CP_SCHEDULERS scheduler1 pre=0x{_cur:08x} write=0x{_new:08x} readback=0x{_rb:08x} (sched1 byte=0x{_sched:02x})")
+      except Exception as e: print(f"am {self.adev.devfmt}: RLC_CP_SCHEDULERS write failed: {e}")
+
     for xcc in range(self.xccs if aql else 1):
       self._grbm_select(me=1, pipe=pipe, queue=queue, inst=xcc)
 
       struct_t = getattr(am, f"struct_v{self.adev.ip_ver[am.GC_HWIP][0]}{'_compute' if self.adev.ip_ver[am.GC_HWIP][0] >= 10 else ''}_mqd")
-      mqd_struct = struct_t(header=0xC0310800, cp_mqd_base_addr_lo=lo32(self.mqd_mc[queue] + 0x1000*xcc),
+      # compute_pipelinestat_enable=1 and compute_misc_reserved=0x3 — Linux's gfx_v10_0_compute_mqd_init
+      # and KFD's init_mqd both set these on every compute MQD. tinygrad was leaving them at 0,
+      # which may be why MEC's pipeline-stat / scheduling logic ignores the queue. Adding to match
+      # upstream parity.
+      mqd_struct = struct_t(header=0xC0310800,
+        compute_pipelinestat_enable=0x00000001, compute_misc_reserved=0x00000003,
+        cp_mqd_base_addr_lo=lo32(self.mqd_mc[queue] + 0x1000*xcc),
         cp_mqd_base_addr_hi=hi32(self.mqd_mc[queue] + 0x1000*xcc), cp_hqd_pipe_priority=0x2, cp_hqd_queue_priority=0xf, cp_hqd_quantum=0x111,
+        # preload_req=1 matches KFD's kfd_mqd_manager_v10.c::init_mqd line 108:
+        # m->cp_hqd_persistent_state = PRELOAD_REQ_MASK | 0x53 << PRELOAD_SIZE_SHIFT
+        # We had bisected this to 0 earlier suspecting CSA dereference faults; the actual fix is
+        # CP_PQ_WPTR_POLL_CNTL1 + CP_HQD_EOP_RPTR.INIT_FETCHER (see end of this method).
         cp_hqd_persistent_state=self.adev.regCP_HQD_PERSISTENT_STATE.encode(preload_size=0x55, preload_req=1),
         cp_hqd_pq_base_lo=lo32(ring_addr>>8), cp_hqd_pq_base_hi=hi32(ring_addr>>8),
         cp_hqd_pq_rptr_report_addr_lo=lo32(rptr_addr), cp_hqd_pq_rptr_report_addr_hi=hi32(rptr_addr),
@@ -329,13 +560,58 @@ class AM_GFX(AM_IP):
 
       self.adev.vram.view(self.mqd_paddr[queue] + 0x1000*xcc, ctypes.sizeof(mqd_struct))[:] = memoryview(mqd_struct).cast('B')
 
-      mqd_st_mv = to_mv(ctypes.addressof(mqd_struct), ctypes.sizeof(mqd_struct)).cast('I')
-      for i, reg in enumerate(range(self.adev.regCP_MQD_BASE_ADDR.addr[xcc], self.adev.regCP_HQD_PQ_WPTR_HI.addr[xcc] + 1)):
-        self.adev.wreg(reg, mqd_st_mv[0x80 + i])
-      self.adev.regCP_HQD_ACTIVE.write(0x1, inst=xcc)
+      if _kcq_direct_hqd:
+        # OLD direct-HQD activation path (debug fallback). Linux's gfx_v10_0_kcq_init_queue does
+        # NOT do this for KCQs — it only builds the MQD in memory and lets MEC firmware load it
+        # via MAP_QUEUES from the KIQ. This block is the KIQ activation pattern (kiq_init_register)
+        # applied to a KCQ, which is wrong but kept here for A/B comparison.
+        mqd_st_mv = to_mv(ctypes.addressof(mqd_struct), ctypes.sizeof(mqd_struct)).cast('I')
+        for i, reg in enumerate(range(self.adev.regCP_MQD_BASE_ADDR.addr[xcc], self.adev.regCP_HQD_PQ_WPTR_HI.addr[xcc] + 1)):
+          self.adev.wreg(reg, mqd_st_mv[0x80 + i])
+
+        # KFD HQD-direct activation tail — matching kgd_hqd_load() in amdgpu_amdkfd_gfx_v10.c.
+        self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.update(doorbell_en=1, doorbell_offset=doorbell*2, inst=xcc)
+        _queue_mask = 1 << (pipe * 8 + queue)
+        try:
+          self.adev.regCP_PQ_WPTR_POLL_CNTL1.write(_queue_mask, inst=xcc)
+        except Exception as e: print(f"am {self.adev.devfmt}: CP_PQ_WPTR_POLL_CNTL1 write failed: {e}")
+        try: self.adev.regCP_HQD_EOP_RPTR.update(init_fetcher=1, inst=xcc)
+        except Exception:
+          try: self.adev.regCP_HQD_EOP_RPTR.write(0x80000000, inst=xcc)
+          except Exception as e2: print(f"am {self.adev.devfmt}: CP_HQD_EOP_RPTR raw write failed: {e2}")
+        self.adev.regCP_HQD_ACTIVE.write(0x1, inst=xcc)
+        try: self.adev.regCP_PQ_STATUS.update(doorbell_enable=1, inst=xcc)
+        except Exception:
+          try:
+            _cur = self.adev.regCP_PQ_STATUS.read(inst=xcc)
+            self.adev.regCP_PQ_STATUS.write(_cur | 0x2, inst=xcc)
+          except Exception as e2: print(f"am {self.adev.devfmt}: CP_PQ_STATUS write failed: {e2}")
+        print(f"am {self.adev.devfmt}: KCQ activated via DIRECT-HQD path (debug fallback, AMD_KCQ_DIRECT_HQD=1)")
+      else:
+        # DEFAULT MAP_QUEUES path — matches Linux gfx_v10_0_kcq_init_queue: build MQD only,
+        # let MEC firmware load it via MAP_QUEUES PM4 packet through the KIQ ring (issued
+        # below, after this loop).
+        print(f"am {self.adev.devfmt}: KCQ MQD built; activation deferred to KIQ MAP_QUEUES")
 
       self.adev.gmc.flush_hdp()
       self._grbm_select(inst=xcc)
+
+    # KIQ MAP_QUEUES bootstrap: if the KIQ is alive, submit a MAP_QUEUES PM4 packet for our compute
+    # queue. This tells MEC's scheduler to start dispatching this queue. Without this, MEC has the
+    # HQD active but never picks it up because no SET_RESOURCES/MAP_QUEUES sequence ever ran.
+    if getattr(self, 'kiq_setup_done', False) and not aql:
+      try:
+        self._kiq_map_queues(ring_me=1, ring_pipe=pipe, ring_queue=queue,
+                             doorbell_idx=doorbell, mqd_addr=self.mqd_mc[queue],
+                             wptr_addr=wptr_addr)
+        time.sleep(0.05)
+        # Re-read RPTR/ACTIVE for the compute queue under the per-pipe context
+        self._grbm_select(me=1, pipe=pipe, queue=queue, inst=0)
+        rptr_after = self.adev.regCP_HQD_PQ_RPTR.read()
+        active_after = self.adev.regCP_HQD_ACTIVE.read()
+        self._grbm_select(inst=0)
+        print(f"am {self.adev.devfmt}: post-MAP_QUEUES compute queue: ACTIVE=0x{active_after:x} RPTR=0x{rptr_after:x} (host_kiq_wptr_bytes={self.kiq_host_wptr_dws*4})")
+      except Exception as e: print(f"am {self.adev.devfmt}: KIQ map_queues failed: {e}")
     return doorbell
 
   def set_clockgating_state(self):
@@ -505,16 +781,19 @@ class AM_SDMA(AM_IP):
                                                           inst=inst)
         self.adev.reg(f"regSDMA{pipe}_{self.sdma_name}_CNTL").update(halt=0, **{f"{'th1_' if self.sdma_name == 'F32' else ''}reset":0}, inst=inst)
       else:
-        # SDMA < 6.0.0 (RDNA2 sdma_v5_2 etc.) — the F32 microcontroller starts halted+reset after PSP
-        # loads the firmware. Clear BOTH HALT and RESET so the engine starts running and reads the
-        # wptr poll address. Without this, queue submissions are silently ignored (rb_wptr stays at 0
-        # even after the host writes the wptr poll memory). Linux's sdma_v5_2_enable clears both bits
-        # in a single write (the kernel calls them HALT and TH1_RESET; on RDNA2 sh_mask the second
-        # field is just `RESET` at bit 9).
+        # SDMA < 6.0.0 (RDNA2 sdma_v5_2 etc.) — Linux's sdma_v5_2_gfx_resume_instance programs UTCL1
+        # cache + cntl unconditionally for v5.2, then clears F32 HALT (and we additionally clear RESET,
+        # which the kernel calls TH1_RESET on newer parts). Without UTCL1_CNTL/UTCL1_PAGE the L1
+        # translation cache defaults are wrong and the engine accepts register writes but doesn't
+        # actually perform DMA. The order matches Linux: UTCL1 config first, then unhalt.
+        self.adev.reg(f"regSDMA{pipe}_UTCL1_CNTL").update(resp_mode=3, redo_delay=9, inst=inst)
+        self.adev.reg(f"regSDMA{pipe}_UTCL1_PAGE").update(rd_l2_policy=2, wr_l2_policy=3, llc_noalloc=1, inst=inst)
         self.adev.reg(f"regSDMA{pipe}_F32_CNTL").update(halt=0, reset=0, inst=inst)
 
+      # MIDCMD_PREEMPT_ENABLE is set alongside UTC_L1_ENABLE in Linux's sdma_v5_2 path; without it the
+      # engine's command parser may stall on the first packet even with a valid wptr.
       self.adev.reg(f"regSDMA{pipe}_CNTL").update(trap_enable=1,
-        **({'utc_l1_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP] <= (5,2,0) else {}), inst=inst)
+        **({'utc_l1_enable':1, 'midcmd_preempt_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP] <= (5,2,0) else {}), inst=inst)
 
     if self.adev.ip_ver[am.NBIO_HWIP] in {(7,9,0), (7,9,1)}:
       for aid_id in range(4):
@@ -557,17 +836,47 @@ class AM_SDMA(AM_IP):
     doorbell = am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 + (pipe+queue*4) * 0xA
     self.sdma_reginst.append((reg, inst))
 
+    # SEM_WAIT_FAIL_TIMER_CNTL: Linux's sdma_v5_2_gfx_resume_instance unconditionally clears this
+    # before any other ring programming, to prevent semaphore-wait-fail timeouts from hanging the
+    # engine on the first packet. Field-name update would require knowing the field layout; the
+    # whole register is set to 0, so a raw write is fine.
+    if self.adev.ip_ver[am.SDMA0_HWIP][0] == 5:
+      # SEM_WAIT_FAIL_TIMER_CNTL is per-engine (not per-queue-type), so the register name has no
+      # _GFX_ infix — use regSDMA{pipe}_SEM_WAIT_FAIL_TIMER_CNTL, not {reg}_SEM_WAIT_FAIL_TIMER_CNTL
+      # which would expand to regSDMA0_GFX_SEM_WAIT_FAIL_TIMER_CNTL.
+      try: self.adev.reg(f"regSDMA{pipe}_SEM_WAIT_FAIL_TIMER_CNTL").write(0x0, inst=inst)
+      except Exception as e: print(f"am {self.adev.devfmt}: SEM_WAIT_FAIL_TIMER_CNTL clear failed: {e}")
+
     self.adev.reg(f"{reg}_MINOR_PTR_UPDATE").write(0x1, inst=inst)
     self.adev.wreg_pair(f"{reg}_RB_RPTR", "", "_HI", 0, inst=inst)
     self.adev.wreg_pair(f"{reg}_RB_WPTR", "", "_HI", 0, inst=inst)
     self.adev.wreg_pair(f"{reg}_RB_BASE", "", "_HI", ring_addr >> 8, inst=inst)
     self.adev.wreg_pair(f"{reg}_RB_RPTR_ADDR", "_LO", "_HI", rptr_addr, inst=inst)
     self.adev.wreg_pair(f"{reg}_RB_WPTR_POLL_ADDR", "_LO", "_HI", wptr_addr, inst=inst)
+    # WPTR_POLL_CNTL has TWO enable bits and BOTH must be set on sdma_v5_2:
+    #   - `enable` (bit 0): MASTER poll subsystem enable. Without it, the polling machinery
+    #     is dormant — STATUS_REG.WPTR_POLLING stays 0 and wptr_gpu_addr writes do nothing.
+    #   - `f32_poll_enable` (bit 2): the F32-side poll arming, separate from the master bit.
+    # Tinygrad previously only set f32_poll_enable, leaving the master bit clear, which made
+    # the poll path silently dead. Verified empirically: setting enable=1 transitions
+    # STATUS_REG from IDLE/RB_EMPTY to actively fetching memory and the engine starts
+    # ingesting wptr_gpu_addr writes for the first time. Drop the try/except — silent
+    # exception swallowing is what hid this bug for two days. v6+ moved both bits into
+    # RB_CNTL itself, which is why the previous gate skipped v5.x.
+    if self.adev.ip_ver[am.SDMA0_HWIP][0] == 5:
+      self.adev.reg(f"{reg}_RB_WPTR_POLL_CNTL").update(enable=1, f32_poll_enable=1, inst=inst)
     self.adev.reg(f"{reg}_DOORBELL_OFFSET").update(offset=doorbell * 2, inst=inst)
     self.adev.reg(f"{reg}_DOORBELL").update(enable=1, inst=inst)
+    # Second RB_WPTR/HI write while MINOR_PTR_UPDATE=1: Linux's sdma_v5_2_gfx_resume_instance
+    # explicitly stamps RB_WPTR (with ring->wptr<<2, typically 0) inside the MINOR_PTR_UPDATE=1
+    # window before clearing it. This is the commit-arming sequence — without writing the wptr
+    # while MINOR_PTR_UPDATE is set, the wptr commit machinery stays armed-but-unfired and the
+    # engine never picks up subsequent wptr changes.
+    self.adev.wreg_pair(f"{reg}_RB_WPTR", "", "_HI", 0, inst=inst)
     self.adev.reg(f"{reg}_MINOR_PTR_UPDATE").write(0x0, inst=inst)
-    # WPTR_POLL_ENABLE was added in RDNA3+ (SDMA 6.x). RDNA2 SDMA v5.2's regSDMA0_GFX_RB_CNTL has no
-    # such field — only RB_ENABLE, RB_SIZE, RB_VMID, RPTR_WRITEBACK_*, RB_PRIV, RPTR_WB_IDLE.
+    # WPTR_POLL_ENABLE was added in RDNA3+ (SDMA 6.x) inside RB_CNTL itself. RDNA2 SDMA v5.2's
+    # regSDMA0_GFX_RB_CNTL has no such field — only RB_ENABLE, RB_SIZE, RB_VMID, RPTR_WRITEBACK_*,
+    # RB_PRIV, RPTR_WB_IDLE. The v5.2 equivalent (F32_POLL_ENABLE) lives in WPTR_POLL_CNTL, set above.
     needs_wptr_poll = self.adev.ip_ver[am.SDMA0_HWIP][:2] != (4,4) and self.adev.ip_ver[am.SDMA0_HWIP][0] >= 6
     self.adev.reg(f"{reg}_RB_CNTL").write(**({f'{self.sdma_name.lower()}_wptr_poll_enable':1} if needs_wptr_poll else {}),
       rb_vmid=0, rptr_writeback_enable=1, rptr_writeback_timer=4, rb_enable=1, rb_priv=1, rb_size=(ring_size//4).bit_length()-1, inst=inst)

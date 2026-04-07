@@ -142,6 +142,17 @@ class AMFirmware:
         self.descs += [self.desc(blob, hdr.data_offset_bytes, hdr.data_size_bytes, *stack_fws)]
         self.ucode_start[fw_name] = hdr.ucode_start_addr_lo | (hdr.ucode_start_addr_hi << 32)
 
+    # MEC2 firmware load (RDNA2 / Sienna Cichlid) — PUNTED. Both attempted paths failed empirically:
+    # 1. Two consecutive GFX_FW_TYPE_CP_MEC (type 4) LOAD_IP_FW: PSP corrupts both MEC instances.
+    # 2. Same + GFX_CMD_ID_AUTOLOAD_RLC kick: autoload reports bootload_complete=1 but BOTH MEC
+    #    headers are poison post-init; the autoload+individual-LOAD_IP_FW combination on Sienna
+    #    Cichlid does not preserve the staged firmware. The proper fix is to port Linux's
+    #    gfx_v10_0_rlc_backdoor_autoload_* family which constructs an RLC TOC at runtime and stages
+    #    all firmwares into a single contiguous fw_buf. sienna_cichlid_toc.bin does NOT exist as a
+    #    separate file in linux-firmware (404 at the pinned commit), confirming the TOC is built
+    #    at runtime, not loaded as a blob. Implementing this is a significant scope expansion;
+    #    deferred until KIQ-on-me=1 (with mec1-only baseline) is fully ruled out.
+
     # IMU firmware
     if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0):
       blob, hdr = self.load_fw(f"gc_{fmt_ver(am.GC_HWIP)}_imu.bin", am.struct_imu_firmware_header_v1_0)
@@ -267,8 +278,8 @@ class AMDev:
     # runs at default clock-gating settings. Proper fix is the same shape as the set_clocks one.
     for ip in [self.soc, self.gfx]:
       try: ip.set_clockgating_state()
-      except TimeoutError as e:
-        if DEBUG >= 2: print(f"am {self.devfmt}: skipping {ip.__class__.__name__}.set_clockgating_state ({e})")
+      except (TimeoutError, AttributeError) as e:
+        if DEBUG >= 2: print(f"am {self.devfmt}: skipping {ip.__class__.__name__}.set_clockgating_state ({type(e).__name__}: {e})")
     self.reg("regSCRATCH_REG7").write(AMDev.Version)
     self.reg("regSCRATCH_REG6").write(1) # set initialized state.
     if DEBUG >= 2: print(f"am {self.devfmt}: boot done")
