@@ -561,7 +561,17 @@ class HCQAllocator(HCQAllocatorBase, Generic[HCQDeviceType]):
   def _copyin(self, dest:HCQBuffer, src:memoryview):
     if self.dev.hw_copy_queue_t is None:
       self.dev.synchronize()
-      with cpu_profile(f'TINY -> {self.dev.device}', f"{self.dev.device}:COPY"): ctypes.memmove(int(dest.va_addr), from_mv(src), len(src))
+      # On the KFD iface, GPUVA == host VA (unified addressing) so memmove(int(dest.va_addr), ...) works.
+      # On the AM iface (PCIe userspace, e.g. macOS dext), dest.va_addr is a GPU virtual address in the
+      # GPUVMA range (e.g. 0x200002000000), NOT a host pointer — memmoving to it segfaults. The buffer
+      # has cpu_access=True (forced when has_sdma_queue is False, see ops_amd.py:1098), so it has a
+      # valid cpu_view() pointing at the BAR-mapped or sysmem-mapped host-accessible region. Use that.
+      with cpu_profile(f'TINY -> {self.dev.device}', f"{self.dev.device}:COPY"):
+        try:
+          dest.cpu_view().view(size=len(src), fmt='B')[:] = src.cast('B')
+        except Exception:
+          # Fallback to the original KFD-style path for backends where cpu_view isn't available.
+          ctypes.memmove(int(dest.va_addr), from_mv(src), len(src))
       return
 
     with hcq_profile(self.dev, queue_type=self.dev.hw_copy_queue_t, desc=TracingKey(f"TINY -> {self.dev.device}", ret=src.nbytes), enabled=PROFILE,
@@ -598,7 +608,13 @@ class HCQAllocator(HCQAllocatorBase, Generic[HCQDeviceType]):
   def _copyout(self, dest:memoryview, src:HCQBuffer):
     self.dev.synchronize()
     if self.dev.hw_copy_queue_t is None:
-      with cpu_profile(f'{self.dev.device} -> TINY', f"{self.dev.device}:COPY"): ctypes.memmove(from_mv(dest), int(src.va_addr), len(dest))
+      # Symmetric to _copyin: on the AM iface, src.va_addr is a GPU virtual address, not a host pointer.
+      # Use the buffer's cpu_view() to read through the BAR/sysmem-mapped host-accessible region.
+      with cpu_profile(f'{self.dev.device} -> TINY', f"{self.dev.device}:COPY"):
+        try:
+          dest.cast('B')[:] = src.cpu_view().view(size=len(dest), fmt='B')[:]
+        except Exception:
+          ctypes.memmove(from_mv(dest), int(src.va_addr), len(dest))
       return
 
     with hcq_profile(self.dev, queue_type=self.dev.hw_copy_queue_t, desc=TracingKey(f"{self.dev.device} -> TINY", ret=dest.nbytes), enabled=PROFILE,

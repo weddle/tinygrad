@@ -20,7 +20,6 @@ def __getattr__(nm):
                                    args=["-I/opt/rocm/include", "-x", "c++"], srcs=am_src)
     case "smu_v11_0_7": return load("am/smu_v11_0_7",[],[f"{AMD}/pm/swsmu/inc/pmfw_if/{s}.h" for s in ["smu_v11_0_7_ppsmc","smu11_driver_if_sienna_cichlid"]]
                                     +[root/"extra/amdpci/headers/amdgpu_smu.h"], args=inc, srcs=am_src)
-    case "v10_structs": return load("am/v10_structs", [], [f"{AMDINC}/v10_structs.h"], args=inc, srcs=am_src, rules=kern_rules)
     case "smu_v13_0_0": return load("am/smu_v13_0_0",[],[f"{AMD}/pm/swsmu/inc/pmfw_if/{s}.h" for s in ["smu_v13_0_0_ppsmc","smu13_driver_if_v13_0_0"]]
                                     +[root/"extra/amdpci/headers/amdgpu_smu.h"], args=inc, srcs=am_src)
     case "smu_v13_0_6": return load("am/smu_v13_0_6",[],[f"{AMD}/pm/swsmu/inc/pmfw_if/{s}.h" for s in ["smu_v13_0_6_ppsmc","smu_v13_0_6_pmfw", \
