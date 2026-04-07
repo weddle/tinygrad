@@ -346,12 +346,35 @@ class AM_GFX(AM_IP):
     self.kiq_rptr_addr = self.kiq_meta_va + 0x00
     self.kiq_wptr_addr = self.kiq_meta_va + 0x08
     # Cleaner-shader buffer (Linux gfx10_kiq_set_resources writes cleaner_shader_gpu_addr >> 8 in
-    # dwords 4 and 5 of SET_RESOURCES). Linux allocates a real cleaner shader BO; for RDNA2
-    # bring-up we just allocate a zero-filled 256-byte stub. Use GPUVA (not MC) to match the
-    # convention ring/MQD addresses follow in this driver.
+    # dwords 4 and 5 of SET_RESOURCES). Linux allocates a real BO and copies the gfx10_3_0
+    # cleaner shader bytes from drivers/gpu/drm/amd/amdgpu/gfx_v10_0_cleaner_shader.h into it.
+    # Source: gfx_10_3_0_cleaner_shader_hex[] in that header (60 dwords = 240 bytes).
+    # Use GPUVA (not MC) to match the convention ring/MQD addresses follow in this driver.
     _cleaner_mapping = self.adev.mm.valloc(0x100, uncached=True, contiguous=True)
     self.kiq_cleaner_shader_va = _cleaner_mapping.va_addr
-    print(f"am {self.adev.devfmt}: KIQ ring va=0x{self.kiq_ring_va:x} paddr=0x{_ring_paddr:x}; meta va=0x{self.kiq_meta_va:x} paddr=0x{_meta_paddr:x}; cleaner_shader va=0x{self.kiq_cleaner_shader_va:x}")
+    _cleaner_paddr = _cleaner_mapping.paddrs[0][0]
+    # Linux gfx_10_3_0_cleaner_shader_hex[] from gfx_v10_0_cleaner_shader.h
+    _cleaner_shader_dws = [
+      0xb0804004, 0xbf8a0000, 0xbe8203b8, 0xbefc0380,
+      0x7e008480, 0x7e028480, 0x7e048480, 0x7e068480,
+      0x7e088480, 0x7e0a8480, 0x7e0c8480, 0x7e0e8480,
+      0xbefc0302, 0x80828802, 0xbf84fff5, 0xbe8203ff,
+      0x80000000, 0x87020002, 0xbf840012, 0xbefe03c1,
+      0xbeff03c1, 0xd7650001, 0x0001007f, 0xd7660001,
+      0x0002027e, 0x16020288, 0xbe8203bf, 0xbefc03c1,
+      0xd9382000, 0x00020201, 0xd9386040, 0x00040401,
+      0xd70f6a01, 0x000202ff, 0x00000400, 0x80828102,
+      0xbf84fff7, 0xbefc03ff, 0x00000068, 0xbe803080,
+      0xbe813080, 0xbe823080, 0xbe833080, 0x80fc847c,
+      0xbf84fffa, 0xbeea0480, 0xbeec0480, 0xbeee0480,
+      0xbef00480, 0xbef20480, 0xbef40480, 0xbef60480,
+      0xbef80480, 0xbefa0480, 0xbf810000, 0xbf9f0000,
+      0xbf9f0000, 0xbf9f0000, 0xbf9f0000, 0xbf9f0000,
+    ]
+    _cleaner_view = self.adev.pci_dev.map_bar(bar=0, off=_cleaner_paddr, size=0x100, fmt='I')
+    for i, dw in enumerate(_cleaner_shader_dws): _cleaner_view[i] = dw
+    self.adev.gmc.flush_hdp()
+    print(f"am {self.adev.devfmt}: KIQ ring va=0x{self.kiq_ring_va:x} paddr=0x{_ring_paddr:x}; meta va=0x{self.kiq_meta_va:x} paddr=0x{_meta_paddr:x}; cleaner_shader va=0x{self.kiq_cleaner_shader_va:x} paddr=0x{_cleaner_paddr:x} ({len(_cleaner_shader_dws)} dwords loaded)")
     self.kiq_set_resources_sent = False
 
     # Build the KIQ MQD struct (compute MQD shape, KIQ-specific values)
