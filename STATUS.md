@@ -130,6 +130,18 @@ These are the *verified* positive facts. Anything not on this list is untested.
    - `arange(256).sum() == 32640` — reduction + larger shape
    - Matmul sweep `16x16`, `64x64`, `128x128` — all return correct values, all dispatch-latency-bound at ~25ms (not compute-bound)
 
+5. **LLM ladder Phase 2 (transformer primitive coverage) passes.** `scripts/diag/llm_ladder_phase2_primitives.py` verifies every primitive used by transformer inference against a CPU-computed reference:
+   - `softmax` 1D + 2D with `axis=-1`
+   - `gelu` (tanh approximation, matching tinygrad's implementation)
+   - `silu` (= `x * sigmoid(x)`)
+   - `layernorm` unweighted, with all-zero and all-same-value edge cases
+   - `nn.Embedding(8,4)` lookup with manually-seeded weights
+   - Reductions: full `sum()`, `sum(axis=0)`, multi-axis `sum(axis=(0,1))`, `sum(axis=-1, keepdim=True)`, `mean(axis=1)`, `max(axis=2)`
+   - Shape ops: `reshape`, `permute(2,0,1)`, composed `permute().transpose(0,1)`
+   - Attention-shape dress rehearsal: `(Q @ K.transpose(-1,-2) / sqrt(d_k)).softmax(axis=-1) @ V` at `(B=1, H=4, S=8, D=16)`, compiled as a fused kernel, output finite
+
+   17 checks total, all pass. First time an attention-shape kernel has been compiled and dispatched on this path; first on-device `Tensor.randn` and `manual_seed`; first multi-axis reductions.
+
 5. **Multi-process re-entry works without a cable replug.** A new Python process immediately after a clean exit of a previous one takes the `partial_boot` path: `AM_GFX.init_hw` calls `reset_mec()` and then re-runs `_setup_kiq()` (with the Step 0 dequeue-if-active check matching Linux `gfx_v10_0.c:7036-7046`) to rebuild per-process KIQ state. Verified for at least 5 consecutive processes in a row across three kernel shapes (arange, matmul, elementwise).
 
 6. **Clean process exit.** `amdev.py::fini()` wraps the SMU `set_clocks(level=0)` call in a `try/except TimeoutError` matching the pre-existing init-path pattern. Process exit is clean; no noisy traceback; GPU stays enumerated to macOS IOKit so the next process can open it.
