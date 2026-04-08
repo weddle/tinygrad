@@ -61,25 +61,43 @@ After that cleanup, compute runs on this fork work as the normal user.
 
 ## Current Status
 
-Short version: **one tinygrad compute workload has executed end-to-end on this hardware path for the first time.** Specifically:
+Short version: **the backend now runs real tinygrad compute and has reached the first bounded real-model checkpoint.** Specifically:
 
 ```
 Tensor.arange(16, device='AMD').realize().tolist()
 # returns [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 ```
 
+and:
+
+```bash
+PYTHONPATH=. AMD_IFACE=PCI DEV=AMD:LLVM AMD_KIQ_BOOTSTRAP=1 \
+/Users/ryan/Projects/Lab/asm2464pd-firmware/.venv/bin/python3 \
+examples/gpt2.py --model_size gpt2 --count 1 --temperature 0 --prompt 'Hello'
+```
+
+completed and generated:
+
+```text
+Hello,
+```
+
 That is the entire claim. A single 16-element `arange` kernel dispatches through the AM PM4 path, executes on MEC1, writes back, and the host copyout returns the correct values. This is meaningful because every prior run on this hardware path either hung on compute queue activation or hung on compute queue fetch.
 
 It is **not** a claim that:
-- other workloads work (none have been tested)
-- multiple dispatches per session work (untested)
-- larger tensors or more complex ops work (untested)
-- training or graph execution work (untested)
-- the fork is stable or safe for general use (it is not)
-- the driver is performant (untested, likely far from it)
-- the fini/shutdown path is clean (it still raises `SMU msg 0x1f timeout` at atexit — pre-existing, unrelated to compute)
+- general LLM support is complete
+- larger GPT-style generation loops are stable
+- training works
+- all examples work unmodified
+- the fork is stable or safe for general use
+- performance is tuned
 
-The only verified fact is: one specific minimal compute kernel ran correctly in one run, once.
+But it is now stronger than a one-kernel-once claim. The verified envelope includes:
+- repeated eager compute
+- transformer primitives
+- TinyJit replay
+- tiny transformer forward
+- first bounded GPT-2 generation
 
 ### 2026-04-08 — what actually landed
 
@@ -161,6 +179,13 @@ These are the *verified* positive facts. Anything not on this list is untested.
 
    52 checks total, all pass. First complete transformer block forward compiled and dispatched on this path; multi-layer stacking produces finite results; cross-call stability is bitwise-identical; full 2-layer forward captures as a single JIT graph and replays correctly.
 
+8. **LLM ladder Phase 5 (in-tree example validation) passes as a bounded claim.** Using the upstream `examples/gpt2.py` as shipped, with no modifications:
+   - `examples/gpt2.py --model_size gpt2 --count 1 --temperature 0 --prompt 'Hello'` loads GPT-2 small weights from HuggingFace on the RDNA2 path and produces `"Hello,"`
+   - `examples/gpt2.py --model_size gpt2 --count 3 --temperature 0 --prompt 'Hello'` produces `"Hello, I'm"`
+   - The AMD backend correctly executes every kernel the example dispatches.
+
+   **Scope limitation: this is a bounded claim for the upstream-intended single-`generate()`-per-process usage pattern.** Multiple `generate()` calls in the same process trigger a latent upstream tinygrad `TinyJit` bug where `Variable.val`-read Python branches in `examples/gpt2.py` bake in as constants at capture time. The bug was isolated via cross-backend discriminator runs: the same failure reproduces bit-exact on METAL (unrelated backend, same Mac mini), and disabling JIT (`JIT=0`) on the AMD backend makes the matrix pattern pass. Neither of those results implicates the AMD backend. Full trace and possible fix candidates at `learnings/upstream-tinyjit-var-val-capture-baking.md` in the companion `tiny-egpu` repo. The upstream bug has been noted but not yet filed.
+
 5. **Multi-process re-entry works without a cable replug.** A new Python process immediately after a clean exit of a previous one takes the `partial_boot` path: `AM_GFX.init_hw` calls `reset_mec()` and then re-runs `_setup_kiq()` (with the Step 0 dequeue-if-active check matching Linux `gfx_v10_0.c:7036-7046`) to rebuild per-process KIQ state. Verified for at least 5 consecutive processes in a row across three kernel shapes (arange, matmul, elementwise).
 
 6. **Clean process exit.** `amdev.py::fini()` wraps the SMU `set_clocks(level=0)` call in a `try/except TimeoutError` matching the pre-existing init-path pattern. Process exit is clean; no noisy traceback; GPU stays enumerated to macOS IOKit so the next process can open it.
@@ -171,13 +196,16 @@ These are the *verified* positive facts. Anything not on this list is untested.
 
 These things have **not** been tested on this fork yet, and should not be assumed to work:
 
-- **LLM ladder Phases 2 through 6** — primitive coverage (softmax/layernorm/gelu/silu/embedding/reductions/attention-shape), TinyJit, tiny transformer forward, tinygrad's `examples/transformer.py` / `examples/gpt2.py`, and the first controlled GPT-2 small inference. These are the planned next rungs of the ladder.
-- Matmul sizes beyond `128x128` — dispatch cost dominates at the sizes tested, so no compute-throughput claim has been measured
-- Convolution (`conv2d`, etc.) — not exercised
-- Training-shaped workloads (autograd, optimizer step, `backward()`) — not exercised
-- Larger tensor allocations and multi-tensor memory pressure beyond what Phase 1 touches
-- Any performance claim at all (no benchmarking)
-- `mode1_reset` on Sienna Cichlid — still known-broken on this ASIC, but no longer a practical blocker because `partial_boot` re-entry handles warm re-open
+- **LLM ladder Phase 6** — the first "controlled GPT-2 inference" claim (bounded, deterministic, with a smoke test that warm re-entry still works afterwards). Phases 1 through 5 are passing; Phase 6 is the next rung.
+- **Multiple `generate()` calls in the same process on `examples/gpt2.py`** — blocked by a known upstream tinygrad `TinyJit` bug (see item 8 in "What Is Working" and `learnings/upstream-tinyjit-var-val-capture-baking.md`). Cross-backend and JIT-off discriminators confirm this is not an AMD backend issue.
+- **`examples/transformer.py` training smoke test** — it's a real training script, not a short inference check; not yet wrapped for this ladder.
+- **Prompts other than `"Hello"` for multi-token generation** — expected values not verified against a reference implementation.
+- Matmul sizes beyond `128x128` — dispatch cost dominates at the sizes tested, so no compute-throughput claim has been measured.
+- Convolution (`conv2d`, etc.) — not exercised.
+- Training-shaped workloads (autograd, optimizer step, `backward()`) — not exercised.
+- Larger tensor allocations and multi-tensor memory pressure beyond what Phases 1-5 touch.
+- Any performance claim at all (no benchmarking).
+- `mode1_reset` on Sienna Cichlid — still known-broken on this ASIC, but no longer a practical blocker because `partial_boot` re-entry handles warm re-open.
 
 ## What Is Not Working
 
