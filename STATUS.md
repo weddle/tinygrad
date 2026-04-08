@@ -186,6 +186,19 @@ These are the *verified* positive facts. Anything not on this list is untested.
 
    **Scope limitation: this is a bounded claim for the upstream-intended single-`generate()`-per-process usage pattern.** Multiple `generate()` calls in the same process trigger a latent upstream tinygrad `TinyJit` bug where `Variable.val`-read Python branches in `examples/gpt2.py` bake in as constants at capture time. The bug was isolated via cross-backend discriminator runs: the same failure reproduces bit-exact on METAL (unrelated backend, same Mac mini), and disabling JIT (`JIT=0`) on the AMD backend makes the matrix pattern pass. Neither of those results implicates the AMD backend. Full trace and possible fix candidates at `learnings/upstream-tinyjit-var-val-capture-baking.md` in the companion `tiny-egpu` repo. The upstream bug has been noted but not yet filed.
 
+9. **LLM ladder Phase 6 (first controlled LLM claim) passes.** `scripts/diag/llm_ladder_phase6_gpt2_inference.py` runs a formal single-generate test with exact-equality assertion and post-generation backend health smoke tests:
+   - `GPT2.build("gpt2")` loads GPT-2 small weights (~500 MB) on the RDNA2 path
+   - `gpt2.generate("Hello", count=3, temperature=0.0, batch_size=1)[0]` returns **exactly** `"Hello, I'm"` (exact string equality, not prefix match)
+   - Three post-generation smoke tests all pass: `Tensor.arange(16).realize().tolist() == [0..15]`, `4×4 ones @ 4×4 ones == [[4.0]*4]*4`, `Tensor.arange(256).sum().item() == 32640`
+
+   **The first controlled LLM claim on this hardware path is:**
+
+   > `gpt2.generate("Hello", count=3, temperature=0.0)` on the RDNA2 path via tinygrad AM over USB4/TB4 → ASM2464PD → OCuLink → PCIe on macOS returns **exactly** `"Hello, I'm"`, and the backend survives the workload — a subsequent `Tensor.arange(16)`, 4×4 matmul, and `arange(256).sum()` all produce correct values in the same process.
+
+   The post-generation health checks are the critical new signal: after loading ~500 MB of model weights and running the full 12-layer GPT-2 small forward through JIT capture + replay for 3 iterations (softmax + layernorm + 48 matmuls + KV cache writes), the simple kernel dispatch path still works correctly against the same expected values Phase 1 verified on a fresh device. The backend is not left in a degraded state by the real-model workload.
+
+   Scoped to single-generate-per-process per the Phase 5 upstream bug finding.
+
 5. **Multi-process re-entry works without a cable replug.** A new Python process immediately after a clean exit of a previous one takes the `partial_boot` path: `AM_GFX.init_hw` calls `reset_mec()` and then re-runs `_setup_kiq()` (with the Step 0 dequeue-if-active check matching Linux `gfx_v10_0.c:7036-7046`) to rebuild per-process KIQ state. Verified for at least 5 consecutive processes in a row across three kernel shapes (arange, matmul, elementwise).
 
 6. **Clean process exit.** `amdev.py::fini()` wraps the SMU `set_clocks(level=0)` call in a `try/except TimeoutError` matching the pre-existing init-path pattern. Process exit is clean; no noisy traceback; GPU stays enumerated to macOS IOKit so the next process can open it.
@@ -196,8 +209,12 @@ These are the *verified* positive facts. Anything not on this list is untested.
 
 These things have **not** been tested on this fork yet, and should not be assumed to work:
 
-- **LLM ladder Phase 6** — the first "controlled GPT-2 inference" claim (bounded, deterministic, with a smoke test that warm re-entry still works afterwards). Phases 1 through 5 are passing; Phase 6 is the next rung.
+- **Larger GPT-2 variants** (`gpt2-medium`, `gpt2-large`, `gpt2-xl`) — only `gpt2` small (124M params) has been run on this path
+- **Longer generations** — the verified generation length is `count=3`; longer sequences have not been tested and would eventually hit the `MAX_CONTEXT` KV cache limit
+- **Prompts other than `"Hello"`** for multi-token generation (expected values not verified against a reference implementation)
+- **Llama, Llama 3, other transformer families** — not tested; out of scope for the current ladder
 - **Multiple `generate()` calls in the same process on `examples/gpt2.py`** — blocked by a known upstream tinygrad `TinyJit` bug (see item 8 in "What Is Working" and `learnings/upstream-tinyjit-var-val-capture-baking.md`). Cross-backend and JIT-off discriminators confirm this is not an AMD backend issue.
+- **`examples/transformer.py` training smoke test** — it's a real training script, not a short inference check; not wrapped for this ladder.
 - **`examples/transformer.py` training smoke test** — it's a real training script, not a short inference check; not yet wrapped for this ladder.
 - **Prompts other than `"Hello"` for multi-token generation** — expected values not verified against a reference implementation.
 - Matmul sizes beyond `128x128` — dispatch cost dominates at the sizes tested, so no compute-throughput claim has been measured.
