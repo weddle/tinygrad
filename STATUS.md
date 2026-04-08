@@ -39,10 +39,36 @@ In practice this work has been driven by iterative CLI-agent review and implemen
 Short version:
 - **device bring-up is materially working**
 - **SDMA is working**
-- **compute queue activation is partially working**
-- **actual compute queue PM4 fetch is still blocked**
+- **compute queue activation is now Linux-faithful and no longer faults**
+- **the UTCL2 instruction-fetch fault wall has been broken** (2026-04-08, v7 arange run)
+- **actual compute queue PM4 fetch is still blocked, but the wall is narrower**
 
-That means the project is no longer stuck in broad firmware/init territory. The current blocker is much narrower than that.
+The 2026-04-08 offline investigation pass decomposed the prior wall into seven independent framing assumptions, and a literal port of Linux's `gfx_v10_0_kiq_init_register` (Investigation 3 fix skeleton) eliminated the deterministic UTCL2 faults that had been present in every prior hardware run.
+
+### 2026-04-08 (v7 arange run) — EOP hypothesis confirmed
+
+Changes landed:
+- `_setup_kiq()` rewritten as a literal port of Linux `gfx_v10_0_kiq_init_register`
+- KIQ placement moved to `me=2 / pipe=0 / queue=0` (Linux default, matches Sienna Cichlid `RLC_CP_SCHEDULERS = 0x58504840` cold-boot pre-config)
+- KIQ EOP buffer allocated (`0x1000` bytes, `eop_size=9`)
+- MQD field corrections: `cp_hqd_active=1` set at build time, `cp_mqd_control` uses the correct `vmid` field (was misusing `priv_state`), `compute_static_thread_mgmt_se[0..3]` only (was `range(8)`), `persistent_state.preload_size=0x53` (was `0x55` plus a spurious `preload_req=1`), dropped unknown `cp_hqd_quantum=0x111`
+- The 58-register bulk write loop was replaced by an explicit Linux-shaped register write sequence terminated by `regCP_HQD_ACTIVE.write` as the final doorbell-then-active handoff
+- The same field corrections were applied to the KCQ MQD build in `setup_ring()`
+- The spurious `regCP_PQ_WPTR_POLL_CNTL1.write` in the default `MAP_QUEUES` path was removed
+
+Results on hardware:
+- The UTCL2 instruction-fetch faults at VA `0x10000`, `0x0`, and `0x48000000000` that were deterministic across v1-v6 are **all gone**
+- `GCVM_L2_PROTECTION_FAULT_STATUS = 0x00000000` (was `0x9b3` / `0x933`)
+- KCQ HQD register state now correctly preserves every MQD-encoded flag: `CP_HQD_PQ_BASE = 0x00010000` (was garbage `0x111`), `CP_HQD_PQ_CONTROL = 0xd0008915` (was `0x4000800c`, with `kmd_queue`, `priv_state`, `unord_dispatch`, and `rptr_block_size=9` all preserved for the first time)
+- KIQ HQD activates cleanly via the Linux-shaped sequence
+
+Residual wall (narrower):
+- `compute_queue: put_value=133 write_ptr[0]=133 read_ptr[0]=0`
+- MEC activates the KCQ cleanly and no longer faults, but does not consume host-submitted PM4 packets
+- `CP_MEC_ME1_HEADER_DUMP = 0xdef0def0` — MEC1 (where the KCQ lives) has not processed a packet
+- `CP_MEC_ME2_HEADER_DUMP = 0x00000000` — MEC2 (where the KIQ now lives) shows a new state, different from prior runs
+
+Interpretation: the entire "VA 0x10000 / 0x0 / EOP" stack of v1-v6 walls was one category of bug (missing EOP buffer + mis-encoded MQD fields + out-of-order register writes), and fixing all three simultaneously eliminated all three symptoms. The new residual is a distinct, narrower problem. It is the first confirmed category-fix of the compute arc.
 
 ## What Is Implemented
 
@@ -55,6 +81,7 @@ This fork includes a substantial RDNA2-specific AM-runtime patch line, including
 - explicit RDNA2 CP firmware descriptor handling
 - Linux-shaped `amdgpu_gfx_enable_kcq()`-style control-path batching
 - KCQ/KIQ doorbell metadata parity fixes
+- **Linux-faithful `_setup_kiq()` port of `gfx_v10_0_kiq_init_register`** (EOP buffer, MQD field corrections, explicit Linux-shaped register write sequence, me=2/pipe=0/queue=0 placement)
 - bring-up diagnostics used to narrow the remaining compute-path issue
 
 The active patch surface for this fork is listed in the README.
@@ -84,24 +111,33 @@ These are the strongest current positive facts:
 7. **The KCQ MQD-referenced virtual addresses all walk validly in the GPU page tables.**
    The current evidence does not support a simple "the queue points at unmapped memory" explanation.
 
+8. **The KIQ/KCQ HQD bring-up is now Linux-faithful and no longer faults.** (New as of 2026-04-08 v7.)
+   `_setup_kiq()` is now a literal port of `gfx_v10_0_kiq_init_register` with a real EOP buffer, corrected MQD fields, and an explicit Linux-shaped register write sequence. The deterministic UTCL2 instruction-fetch faults at VA `0x10000`, `0x0`, and `0x48000000000` that were present across every v1-v6 run are gone. `GCVM_L2_PROTECTION_FAULT_STATUS` reads `0` post-run. The KCQ HQD register state now correctly preserves every flag encoded into the MQD (`kmd_queue`, `priv_state`, `unord_dispatch`, `rptr_block_size=9`).
+
 ## What Is Not Working
 
 The current blocker is:
 
-**The compute queue still does not fetch host-submitted PM4 reliably enough to execute a minimal direct scratch-register test or a tinygrad compute primitive.**
+**The MEC activates the KCQ cleanly and no longer faults, but still does not fetch host-submitted PM4 packets.**
 
-Current observed failure shape:
+Current observed failure shape (2026-04-08 v7):
 - KCQ shows `ACTIVE=1`
-- host-side queue publish advances
-- host-side queue `write_ptr` advances
-- KCQ-side `WPTR_LO` does not latch in the direct KCQ test
-- KCQ-side `RPTR` stays `0`
-- direct KCQ scratch-register PM4 test does not execute
+- the KCQ HQD register state is Linux-faithful for the first time
+- no UTCL2 or GCVM faults during the run
+- host-side queue publish advances: `put_value=133 write_ptr[0]=133`
+- KCQ-side `read_ptr[0]` stays `0`
+- `CP_MEC_ME1_HEADER_DUMP = 0xdef0def0` (MEC1, where the KCQ lives — not executed)
+- `CP_MEC_ME2_HEADER_DUMP = 0x00000000` (MEC2, where the KIQ now lives — new state)
 - `Tensor.arange(16, device='AMD').realize()` still hangs waiting for completion
 
-So the unresolved question is no longer "can we activate a queue?" It is:
+So the unresolved question is now much narrower:
 
-**why does an activated KCQ still not become fetch-ready?**
+**why does MEC1 not pick up the KCQ runlist, given that the queue is correctly mapped, non-faulting, and host-published?**
+
+Leading candidates:
+1. **Cross-MEC scheduling gap.** KIQ now lives on MEC2, KCQ on MEC1. MEC2 processes `SET_RESOURCES` and `MAP_QUEUES` from the KIQ ring, but that has to propagate via RLC scheduler routing to MEC1's runlist. A missing RLC scheduler refresh between SET_RESOURCES and MAP_QUEUES would match the symptom.
+2. **System-memory ring coherence.** The KCQ ring is GTT/system-backed. MEC reads via GFXHUB -> UTCL2 -> PCIe. A missing host-side flush (DMB SY + PCIe write-combining drain) before the doorbell could leave ring contents invisible to the MEC fetcher even though `write_ptr[0]` is published.
+3. **Stale MEC1 instruction-cache base.** MEC1's `CP_CPC_IC_BASE` state may have been inherited from an earlier bring-up attempt and never refreshed, leaving MEC1's scheduler loop unable to advance past its boot-time HEADER_DUMP.
 
 ## What We Have Tried And Mostly Ruled Out
 
@@ -180,57 +216,75 @@ Closed as the main explanation.
 Why:
 - the KCQ ring, `wptr_poll`, `rptr_report`, and `eop_base` all walk validly
 
+### `_setup_kiq()` silently deviating from Linux `gfx_v10_0_kiq_init_register`
+
+Closed as of 2026-04-08 v7.
+
+Why:
+- A line-by-line audit (Investigation 3 of the 2026-04-08 offline investigation queue) identified a concrete category of bugs: missing EOP buffer, multiple mis-encoded MQD fields, and an out-of-order bulk register write loop
+- A literal Linux-faithful rewrite eliminated every deterministic UTCL2 instruction-fetch fault that v1-v6 had hit (at VA 0x10000, 0x0, and 0x48000000000)
+- GCVM fault status is now `0` post-run
+- The fix stays and will not be reverted
+
+### `memory_barrier()` being a no-op on Darwin ARM64
+
+Closed as a real concern (Investigation 4).
+
+Why:
+- An empirical ARM64 disassembly trace of `atomic_thread_fence` on the live Darwin libSystem confirmed the dispatch path reaches `DMB SY`
+- This assumption is refuted and no longer needs to be reinvestigated
+
+### IH faults being orphaned / secondary
+
+Closed (Investigation 2).
+
+Why:
+- The IH ring fault decoder (`SOC15_IH_CLIENTID_UTCL2 = 0x1b`) confirmed the faults were first-order, not secondary fallout
+- The faults identified the real root cause (the KIQ HQD EOP / MQD bug) and that root cause is now fixed
+- Post-fix, the IH ring is clean
+
 ## Current Read Of The Situation
 
-The current state is:
+The current state (as of 2026-04-08 v7) is:
 - queue creation works
-- queue activation gets far enough to show `ACTIVE=1`
-- the MQD in memory looks right
-- the relevant virtual addresses are mapped
-- but the queue still does not actually fetch PM4 in the direct KCQ test
+- queue activation is now Linux-faithful and reaches `ACTIVE=1`
+- the MQD in memory is correct and every flag is preserved in the live HQD register state
+- the relevant virtual addresses are mapped and walk validly
+- the entire UTCL2 / GCVM fault wall is gone
+- but MEC1 still does not fetch host-submitted PM4 from the KCQ
 
-That leaves a narrower and more interesting class of possibilities:
-- `MAP_QUEUES` activation is not equivalent to a fetch-ready queue on this path
-- direct-HQD queue activation may behave differently than the MEC-mediated `MAP_QUEUES` path
-- there is still a missing queue-load / activation semantic detail between "ACTIVE=1" and "fetch-ready"
-- some of the live HQD state visible via `GRBM_SELECT` may not faithfully represent what MEC is actually using
+That leaves three concrete next-step candidates (see "What Is Not Working"):
+- cross-MEC scheduling gap between the KIQ on MEC2 and the KCQ on MEC1
+- system-memory ring coherence / host-side flush before the doorbell
+- stale MEC1 `CP_CPC_IC_BASE` programming left over from earlier bring-up attempts
 
 ## Current Open Areas For Investigation
 
-These are the leading active branches:
+### 1. Co-locate KIQ and KCQ on MEC2 as a cross-MEC discriminator
 
-### 1. `MAP_QUEUES` activation vs direct-HQD activation
-
-This is the highest-value next discriminator.
+Highest-value next discriminator.
 
 Question:
-- does the same minimal KCQ PM4 scratch test behave differently if the queue is materialized by direct HQD activation instead of the normal `MAP_QUEUES` path?
+- if the KCQ is placed on MEC2 alongside the KIQ, does the fetch block go away?
 
 Interpretation:
-- if direct-HQD works and `MAP_QUEUES` does not, the missing piece is in MEC queue-load / activation semantics
-- if both fail, the remaining blocker is lower-level queue publish / doorbell semantics below activation
+- if co-located KCQ works: the missing piece is cross-MEC scheduler routing (RLC refresh between SET_RESOURCES and MAP_QUEUES)
+- if co-located KCQ still fails: the blocker is below MEC scheduling (coherence, doorbell semantics, IC base)
 
-### 2. What does `ACTIVE=1` really mean on gfx10.3 here?
+### 2. RLC scheduler refresh between SET_RESOURCES and MAP_QUEUES
 
-We are explicitly curious about whether:
-- `ACTIVE=1` only means "queue is registered"
-- or whether it should imply "doorbell-consuming and fetch-ready"
+Question:
+- is there a Linux sequence between `SET_RESOURCES` and `MAP_QUEUES` that forces MEC1 to pick up the new queue, which tinygrad is missing?
 
-Right now the evidence says those are not the same thing.
+### 3. PCIe write-combining / host-side flush before doorbell
 
-### 3. How trustworthy is live HQD register readback under `GRBM_SELECT`?
+Question:
+- does an explicit DMB SY + PCIe store-drain (e.g. read-back of a device BAR register) before the doorbell ring cause MEC1 to start fetching?
 
-We have enough evidence to be suspicious of over-reading those registers.
+### 4. MEC1 instruction-cache base refresh
 
-Open question:
-- are we seeing true live queue state, a partial shadow, or MEC-managed state that is not a direct replay of the MQD?
-
-### 4. IH / GCVM fault interpretation
-
-There have been GCVM faults during some of the compute-path experiments, but they have not yet cleanly lined up as the single primary explanation for the no-fetch state.
-
-Open question:
-- which faults are first-order causes, and which are secondary fallout once the run is already wedged?
+Question:
+- is `CP_CPC_IC_BASE` for MEC1 still stale from an earlier partial bring-up, and would re-programming it before KCQ activation change MEC1's `HEADER_DUMP` off `0xdef0def0`?
 
 ## Where Community Feedback Would Be Most Useful
 
@@ -238,10 +292,10 @@ Feedback would be especially useful from anyone who knows gfx10/gfx10.3 compute-
 
 The specific questions we would most like help with are:
 
-1. On gfx10.3, should `MAP_QUEUES` activation be expected to yield a fetch-ready queue immediately, or is there another normal post-map step that matters in practice?
-2. How much trust should we place in live HQD readback for a MEC-managed compute queue on this generation?
-3. Is there a known semantic gap between the normal `MAP_QUEUES` path and direct-HQD/KFD-style activation that could explain `ACTIVE=1` without PM4 fetch?
-4. Are there known pitfalls around the first direct KCQ PM4 test on Navi21 that would not show up as a simple unmapped-VA failure?
+1. On gfx10.3 Sienna Cichlid, is there a normal sequence between `SET_RESOURCES` on the KIQ and the first `MAP_QUEUES` targeting a KCQ on a different MEC that forces the target MEC to enter its scheduler loop? (Specifically, is RLC scheduler re-routing required, or does MAP_QUEUES alone propagate via `RLC_CP_SCHEDULERS` state?)
+2. Is placing the KIQ on MEC2 and the KCQ on MEC1 a supported configuration on Sienna Cichlid, or is the normal Linux assumption that they share a scheduler?
+3. What does `CP_MEC_ME1_HEADER_DUMP = 0xdef0def0` actually mean post-autoload on RDNA2? Is it "MEC1 has not entered its scheduler loop since reset" or something weaker?
+4. On a GTT/system-backed compute ring over PCIe, are there known host-side flush requirements beyond a plain `DMB SY` before ringing the doorbell?
 
 ## Notes On Public Prior Work
 
@@ -256,31 +310,23 @@ That work helped sharpen early PSP-side reasoning even though this fork has sinc
 
 ## Roadmap
 
-Near-term roadmap:
+Near-term roadmap (post-v7):
 
-1. **Power-cycle before the next privileged rerun.**
-   Some of the latest KCQ probes left the GPU in a bad state.
+1. **Co-locate KIQ and KCQ on MEC2 as a single-variable discriminator** for the cross-MEC scheduling hypothesis.
 
-2. **Run the minimal direct KCQ scratch-register PM4 test under both activation paths.**
-   Compare:
-   - normal `MAP_QUEUES`
-   - direct-HQD activation fallback
+2. **If co-location unblocks fetch:** port Linux's RLC scheduler refresh path between `SET_RESOURCES` and `MAP_QUEUES` so the split KIQ/KCQ placement can also work.
 
-3. **Use only a small comparison surface for that A/B.**
-   Compare:
-   - KCQ `WPTR_LO`
-   - KCQ `RPTR`
-   - scratch register result
+3. **If co-location does not unblock fetch:** instrument the doorbell path with an explicit PCIe store-drain (BAR read-back) before the doorbell write and re-run. This discriminates coherence from scheduling.
 
-4. **Branch based on that result.**
-   - if direct-HQD works: focus on MEC queue-load / activation semantics
-   - if both fail: focus on lower-level compute queue publish / doorbell semantics
+4. **If neither co-location nor host-side flush unblocks fetch:** audit `CP_CPC_IC_BASE` programming for MEC1 vs MEC2 and confirm MEC1 has a freshly programmed instruction-cache base.
 
 5. **Keep already-closed branches closed unless new evidence contradicts them.**
    In particular:
    - do not reopen the cleaner-shader branch
    - do not reopen the "ring must be VRAM-backed" branch
    - do not reopen `CP_PQ_WPTR_POLL_CNTL1` as the main theory
+   - do not reopen the `_setup_kiq` field-level parity questions — they are fixed
+   - do not reopen MEC2 firmware-load theories without new evidence (Linux itself does not load MEC2 as a separate ucode on gfx10)
 
 ## Practical Caveat
 
