@@ -152,6 +152,15 @@ These are the *verified* positive facts. Anything not on this list is untested.
 
    41 checks total, all pass. The fused attention kernel (matmul + divide + softmax + matmul) captures and replays correctly under TinyJit on this backend — this is the exact kernel `examples/gpt2.py` uses for every attention layer.
 
+7. **LLM ladder Phase 4 (tiny transformer forward) passes.** `scripts/diag/llm_ladder_phase4_transformer.py` defines a `TinyBlock` class from `tinygrad.nn.Linear` and `tinygrad.nn.LayerNorm` (pre-norm block: 2× LayerNorm + 6× Linear for QKV/output/MLP + scaled dot-product attention + GELU MLP + 2 residual connections). Block shape: `d_model=32, n_heads=4, head_dim=8, mlp_hidden=128`, input `(B=1, S=16, D=32)`:
+   - Random-weight single-block forward: shape correct, output finite
+   - Single-block repeated forward × 10: sum/mean bitwise stable (`tol=1e-6`)
+   - Two-layer stack forward: shape correct, output finite
+   - Two-layer repeated forward × 10: sum/mean bitwise stable
+   - Two-layer JIT-wrapped × 5: output matches eager (`tol=1e-4`)
+
+   52 checks total, all pass. First complete transformer block forward compiled and dispatched on this path; multi-layer stacking produces finite results; cross-call stability is bitwise-identical; full 2-layer forward captures as a single JIT graph and replays correctly.
+
 5. **Multi-process re-entry works without a cable replug.** A new Python process immediately after a clean exit of a previous one takes the `partial_boot` path: `AM_GFX.init_hw` calls `reset_mec()` and then re-runs `_setup_kiq()` (with the Step 0 dequeue-if-active check matching Linux `gfx_v10_0.c:7036-7046`) to rebuild per-process KIQ state. Verified for at least 5 consecutive processes in a row across three kernel shapes (arange, matmul, elementwise).
 
 6. **Clean process exit.** `amdev.py::fini()` wraps the SMU `set_clocks(level=0)` call in a `try/except TimeoutError` matching the pre-existing init-path pattern. Process exit is clean; no noisy traceback; GPU stays enumerated to macOS IOKit so the next process can open it.
