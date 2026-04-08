@@ -299,7 +299,26 @@ class AM_GFX(AM_IP):
       self.adev.regCP_MEC_DOORBELL_RANGE_LOWER.write(0x100 * xcc, inst=xcc)
       self.adev.regCP_MEC_DOORBELL_RANGE_UPPER.write(0x100 * xcc + 0xf8, inst=xcc)
 
+    # Diagnostic: sample CP_MEC_ME{1,2}_HEADER_DUMP before clearing the halts.
+    # If MEC2 HEADER_DUMP goes 0xdef0def0 -> 0x00000000 purely from _enable_mec clearing
+    # CP_MEC_CNTL (no PM4 packet consumed), the v7 "MEC2 is running, MEC1 is not" framing
+    # collapses — both MECs are in the same "halted, never consumed a packet" pre-state.
+    # Only gfx10: the HEADER_DUMP registers exist on RDNA2/gfx10.
+    if self.adev.ip_ver[am.GC_HWIP][0] == 10:
+      try:
+        pre1 = self.adev.regCP_MEC_ME1_HEADER_DUMP.read()
+        pre2 = self.adev.regCP_MEC_ME2_HEADER_DUMP.read()
+        print(f"am {self.adev.devfmt}: pre-_enable_mec HEADER_DUMP me1={pre1:#010x} me2={pre2:#010x}")
+      except Exception as e: print(f"am {self.adev.devfmt}: pre-_enable_mec HEADER_DUMP sample failed: {e}")
+
     self._enable_mec()
+
+    if self.adev.ip_ver[am.GC_HWIP][0] == 10:
+      try:
+        post1 = self.adev.regCP_MEC_ME1_HEADER_DUMP.read()
+        post2 = self.adev.regCP_MEC_ME2_HEADER_DUMP.read()
+        print(f"am {self.adev.devfmt}: post-_enable_mec HEADER_DUMP me1={post1:#010x} me2={post2:#010x}")
+      except Exception as e: print(f"am {self.adev.devfmt}: post-_enable_mec HEADER_DUMP sample failed: {e}")
 
     # Set 1 partition
     if self.xccs > 1: self.adev.psp._spatial_partition_cmd(1)
@@ -767,7 +786,11 @@ class AM_GFX(AM_IP):
     # Linux amdgpu_gfx_enable_kcq() parity: batch SET_RESOURCES + MAP_QUEUES into one KIQ
     # submission for the first KCQ (so MEC sees both without a scheduling-failure window),
     # then MAP_QUEUES alone for any subsequent KCQs. See _kiq_enable_kcq() for the rationale.
-    if getattr(self, 'kiq_setup_done', False) and not aql:
+    #
+    # AMD_KCQ_DIRECT_HQD=1 (debug): SKIP the KIQ MAP_QUEUES entirely so the A/B is genuinely
+    # isolated. Without this skip, direct-HQD is "direct-HQD AND MAP_QUEUES" rather than
+    # "direct-HQD INSTEAD OF MAP_QUEUES" and the A/B does not discriminate.
+    if getattr(self, 'kiq_setup_done', False) and not aql and not _kcq_direct_hqd:
       try:
         self._kiq_enable_kcq(ring_me=1, ring_pipe=pipe, ring_queue=queue,
                              doorbell_idx=doorbell, mqd_addr=self.mqd_mc[queue],
@@ -780,7 +803,20 @@ class AM_GFX(AM_IP):
         self._grbm_select(inst=0)
         print(f"am {self.adev.devfmt}: post-MAP_QUEUES compute queue: ACTIVE=0x{active_after:x} RPTR=0x{rptr_after:x} (host_kiq_wptr_bytes={self.kiq_host_wptr_dws*4})")
       except Exception as e: print(f"am {self.adev.devfmt}: KIQ map_queues failed: {e}")
-    return doorbell
+    # Host doorbell slot index — tinygrad's AMDQueueDesc.doorbell is mapped as
+    # `doorbell64.view(doorbell_index * 8, 8, fmt='Q')` (each slot is 8 bytes).
+    # Linux's WDOORBELL64 uses `cpu_addr + ring->doorbell_index` where cpu_addr
+    # is u32*, so the byte offset is `ring->doorbell_index * 4`. The local
+    # `doorbell` variable above IS Linux's `ring->doorbell_index` (already
+    # pre-shifted by 1 via `(mec_ring0 + idx) << 1`), and the MQD and MAP_QUEUES
+    # packet consumers expect that pre-shifted value. But the host-side `* 8`
+    # view math would write at byte offset `doorbell * 8` (= 48 for idx=0),
+    # while MEC listens at byte offset `doorbell * 4` (= 24). Return
+    # `doorbell >> 1` so that `doorbell_index * 8 = doorbell * 4` and the host
+    # write lands at the correct byte offset MEC is polling. This fixes the
+    # KCQ doorbell-ring-never-received bug that kept MEC1 stuck in the
+    # defNdefN idle-loop pattern through v10.
+    return doorbell >> 1
 
   def set_clockgating_state(self):
     if hasattr(self.adev, 'regMM_ATC_L2_MISC_CG'): self.adev.regMM_ATC_L2_MISC_CG.write(enable=1, mem_ls_enable=1)

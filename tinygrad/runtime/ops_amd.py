@@ -1260,6 +1260,22 @@ class AMDQueueDesc:
 
       # Flush hdp if queue is in dev mem.
       if dev.is_am() and not dev.is_usb(): dev.iface.dev_impl.gmc.flush_hdp()
+
+      # AMD_DOORBELL_DRAIN=1 (debug): force a PCIe store-drain before the doorbell MMIO write.
+      # Rationale: flush_hdp() is a POSTED MMIO write and does not force prior posted writes
+      # to drain from the host-side PCIe path. On tunneled PCIe transports (USB4/TB4) the ring
+      # contents in DRAM, the HDP flush, and the doorbell write can all be in flight at once;
+      # MEC may receive the doorbell before HDP actually invalidates on the GPU side. A bare
+      # MMIO READ from a safe GPU register cannot complete until all prior posted writes from
+      # the same initiator have drained through the bridge (PCIe ordering rule: reads cannot
+      # pass prior writes in the same traffic class). Reading GRBM_STATUS_SE0 here therefore
+      # guarantees the HDP flush has been observed by the GPU before the doorbell is rung.
+      if dev.is_am() and not dev.is_usb() and getenv("AMD_DOORBELL_DRAIN", 0):
+        try: dev.iface.dev_impl.regGRBM_STATUS_SE0.read()
+        except Exception:
+          try: dev.iface.dev_impl.regGRBM_STATUS.read()
+          except Exception: pass
+
       self.doorbell[0] = self.put_value if doorbell_value is None else doorbell_value
     except Exception as e:
       dev.error_state = e
