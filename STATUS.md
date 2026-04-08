@@ -199,6 +199,27 @@ These are the *verified* positive facts. Anything not on this list is untested.
 
    Scoped to single-generate-per-process per the Phase 5 upstream bug finding.
 
+10. **Llama 3.2 1B Instruct GGUF runs on RDNA2 (post-ladder extension).** `python3 examples/llama3.py --size 1B --benchmark --temperature 0 --seed 42` on the upstream example as shipped, no modifications:
+    - Fetches `bartowski/Llama-3.2-1B-Instruct-GGUF` Q6_K quantization (~1 GB) + tokenizer from `bofenghuang/Meta-Llama-3-8B`
+    - Loads 4.94 GB of dequantized weights in 1.72s (**2.88 GB/s**) — ~10× faster than the GPT-2 small `torch_load` path
+    - Runs a deterministic 20-token generation on the hardcoded `"Hello."` prompt at **3.5–3.7 tok/s**
+    - Sustained memory bandwidth: **17–22 GB/s** global, ~21 GB/s param-bandwidth
+    - Output: `"Hello! How can I assist you today?assistant\n\nI can provide information and entertainment"` (benchmark runs 20 iters regardless of stop tokens)
+
+    **New primitives and code paths exercised (not covered by Phases 1–6):**
+    - RMSNorm (vs LayerNorm)
+    - SwiGLU MLP gating: `w2(silu(w1(x)) * w3(x))`
+    - Rotary Position Embeddings (RoPE) via `freqs_cis` parameter
+    - Grouped-query attention (`n_heads=32, n_kv_heads=8`, asymmetric K/V head count)
+    - Q6_K quantized weight load + inline dequantization under JIT
+    - Llama 3 chat-template tokenization with BOS + `<|start_header_id|>` / `<|end_header_id|>` / `<|eot_id|>` special tokens via sentencepiece
+    - `prefill` path (consume prompt in one shot, then single-token generation)
+    - 16-layer transformer forward (vs 12 for GPT-2 small)
+
+    **This is the first run on this path that is compute/weight-bandwidth bound rather than dispatch-latency bound.** GPT-2 small was dispatch-bound at ~25 ms per op regardless of size; Llama 3.2 1B at ~280 ms per token reads ~5 GB of weights each pass at realistic bandwidth rates. The tunnel (USB4/TB4 → ASM2464PD → OCuLink → PCIe) is moving data at its link speed for the first time.
+
+    Not impacted by the Phase 5 upstream TinyJit bug — `--benchmark` is a single continuous generation loop within one script invocation, not a multi-call `generate()` pattern.
+
 5. **Multi-process re-entry works without a cable replug.** A new Python process immediately after a clean exit of a previous one takes the `partial_boot` path: `AM_GFX.init_hw` calls `reset_mec()` and then re-runs `_setup_kiq()` (with the Step 0 dequeue-if-active check matching Linux `gfx_v10_0.c:7036-7046`) to rebuild per-process KIQ state. Verified for at least 5 consecutive processes in a row across three kernel shapes (arange, matmul, elementwise).
 
 6. **Clean process exit.** `amdev.py::fini()` wraps the SMU `set_clocks(level=0)` call in a `try/except TimeoutError` matching the pre-existing init-path pattern. Process exit is clean; no noisy traceback; GPU stays enumerated to macOS IOKit so the next process can open it.
