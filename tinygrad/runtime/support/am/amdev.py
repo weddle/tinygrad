@@ -323,7 +323,15 @@ class AMDev:
   def fini(self):
     if DEBUG >= 2: print(f"am {self.devfmt}: Finalizing")
     for ip in [self.sdma, self.gfx]: ip.fini_hw()
-    self.smu.set_clocks(level=0)
+    # Same try/except as the init path above: set_clocks is a power management optimization
+    # (drop DPM levels to minimum), not a correctness requirement. On RDNA2 / Sienna Cichlid the
+    # SMU PPSMC_MSG_GetDpmFreqByIndex message doesn't match what the firmware expects and times
+    # out (SMU msg 0x1f timeout, response register stuck at 0xff). Letting the timeout propagate
+    # here wedges the GPU in a post-fini state where PSP sOS ring creation fails on the next cold
+    # boot, forcing a full USB4 cable replug. Swallowing the timeout lets fini complete cleanly.
+    try: self.smu.set_clocks(level=0)
+    except TimeoutError as e:
+      if DEBUG >= 2: print(f"am {self.devfmt}: skipping set_clocks(level=0) in fini, running at default clocks ({e})")
     self.ih.interrupt_handler()
     self.reg("regSCRATCH_REG6").write(self.is_err_state) # set finalized state.
 

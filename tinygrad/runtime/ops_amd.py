@@ -1472,6 +1472,13 @@ class PCIIface(PCIIfaceBase):
       doorbell_index = self.dev_impl.gfx.setup_ring(*(rcvr_params:=(ring.va_addr, ring.size, gart.va_addr+rptr, gart.va_addr+wptr,
         eop_buffer.va_addr, eop_buffer.size, is_aql:=(queue_type==kfd.KFD_IOC_QUEUE_TYPE_COMPUTE_AQL), is_aql)))
 
+    # `doorbell_index` here is a SLOT INDEX in the 8-byte-wide doorbell view (doorbell64.view takes a byte offset,
+    # so `doorbell_index * 8` is the byte offset in the BAR). This is NOT Linux's `ring->doorbell_index`, which is
+    # a DWORD index (Linux's `cpu_addr + index` advances by sizeof(u32) = 4 bytes per index). For the host write
+    # to land on the same byte that MEC is listening to, `setup_ring()` must return `linux_ring_doorbell_index >> 1`
+    # on any queue type where Linux pre-shifts by `<< 1`. See learnings/doorbell-fields-and-packets-use-different-units.md
+    # for the full three-site unit table (MQD field, MAP_QUEUES packet DW2, host BAR byte offset). Changing the `* 8`
+    # here is load-bearing across KIQ/KCQ/SDMA and must not be "fixed" without updating every setup_ring() return.
     return AMDQueueDesc(ring=ring.cpu_view().view(fmt='I'), doorbell=self.dev_impl.doorbell64.view(doorbell_index * 8, 8, fmt='Q'), put_value=0,
       read_ptr=gart.cpu_view().view(offset=rptr, size=8, fmt='Q'), write_ptr=gart.cpu_view().view(offset=wptr, size=8, fmt='Q'), params=rcvr_params)
 

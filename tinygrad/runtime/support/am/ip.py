@@ -257,7 +257,26 @@ class AM_GFX(AM_IP):
                 value=True, msg="RLC autoload timeout")
 
     self.adev.gmc.init_hub("GC", inst_cnt=self.xccs)
-    if self.adev.partial_boot: return self.reset_mec()
+    if self.adev.partial_boot:
+      # On partial_boot the GPU's PSP/SMU/GMC are still initialized from the previous AM
+      # process but the new Python process needs fresh per-process KIQ/KCQ software state:
+      # reset_mec() dequeues the KCQs on me=1 and re-cycles the MEC halts (soft reset CP/CPC,
+      # _config_mec halts, _enable_mec unhalts). That leaves MEC microcode loaded and running
+      # but with fresh runtime state. We then still need to re-run _setup_kiq() on gfx10 with
+      # AMD_KIQ_BOOTSTRAP because:
+      #   (a) the Python-side self.kiq_setup_done is a fresh-process attribute, currently False,
+      #       which would make setup_ring() skip the KIQ MAP_QUEUES activation path for KCQs
+      #   (b) the KIQ ring VA is re-allocated via valloc() each process, so the HQD must be
+      #       reprogrammed to point at the new ring memory (the old VA is unmapped in this
+      #       process's address space)
+      # _setup_kiq's Step 0 handles the "old KIQ on me=2 is still active from the previous
+      # process" case via an explicit dequeue-if-active check before the HQD rewrites (Linux
+      # gfx_v10_0.c:7036-7046 parity).
+      self.reset_mec()
+      if self.adev.ip_ver[am.GC_HWIP][0] >= 10 and getenv("AMD_KIQ_BOOTSTRAP", 0):
+        try: self._setup_kiq()
+        except Exception as e: print(f"am {self.adev.devfmt}: partial_boot KIQ setup failed: {e}")
+      return
 
     self._config_mec()
 
@@ -478,6 +497,22 @@ class AM_GFX(AM_IP):
     #      in a single atomic transition instead of flickering through partial states
     #   5. CP_PQ_STATUS.DOORBELL_ENABLE = 1 is the global doorbell enable at the very end
     self._grbm_select(me=self.kiq_me, pipe=self.kiq_pipe, queue=self.kiq_queue, inst=0)
+
+    # Step 0 (Linux gfx_v10_0.c:7036-7046): dequeue any live KIQ HQD before reprogramming.
+    # On cold boot this is a no-op (CP_HQD_ACTIVE reads 0). On partial_boot re-entry the
+    # KIQ from the previous Python process is still active and its HQD points at VAs that
+    # are no longer mapped in this process's address space; we must dequeue before writing
+    # new values or the rewrite can race with the outgoing queue.
+    try:
+      if self.adev.regCP_HQD_ACTIVE.read() & 1:
+        self.adev.regCP_HQD_DEQUEUE_REQUEST.write(0x2)  # 2 = RESET_WAVES
+        try:
+          wait_cond(lambda: self.adev.regCP_HQD_ACTIVE.read() & 1, value=0,
+                    msg="KIQ pre-setup dequeue timeout", timeout_ms=1000)
+        except TimeoutError as e:
+          print(f"am {self.adev.devfmt}: KIQ pre-setup dequeue timeout (continuing): {e}")
+    except Exception as e:
+      print(f"am {self.adev.devfmt}: KIQ pre-setup dequeue probe failed (continuing): {e}")
 
     # Step 1: Linux 7034 — disable global wptr poll master enable before any HQD writes
     try: self.adev.regCP_PQ_WPTR_POLL_CNTL.update(en=0)
@@ -803,19 +838,15 @@ class AM_GFX(AM_IP):
         self._grbm_select(inst=0)
         print(f"am {self.adev.devfmt}: post-MAP_QUEUES compute queue: ACTIVE=0x{active_after:x} RPTR=0x{rptr_after:x} (host_kiq_wptr_bytes={self.kiq_host_wptr_dws*4})")
       except Exception as e: print(f"am {self.adev.devfmt}: KIQ map_queues failed: {e}")
-    # Host doorbell slot index — tinygrad's AMDQueueDesc.doorbell is mapped as
-    # `doorbell64.view(doorbell_index * 8, 8, fmt='Q')` (each slot is 8 bytes).
-    # Linux's WDOORBELL64 uses `cpu_addr + ring->doorbell_index` where cpu_addr
-    # is u32*, so the byte offset is `ring->doorbell_index * 4`. The local
-    # `doorbell` variable above IS Linux's `ring->doorbell_index` (already
-    # pre-shifted by 1 via `(mec_ring0 + idx) << 1`), and the MQD and MAP_QUEUES
-    # packet consumers expect that pre-shifted value. But the host-side `* 8`
-    # view math would write at byte offset `doorbell * 8` (= 48 for idx=0),
-    # while MEC listens at byte offset `doorbell * 4` (= 24). Return
-    # `doorbell >> 1` so that `doorbell_index * 8 = doorbell * 4` and the host
-    # write lands at the correct byte offset MEC is polling. This fixes the
-    # KCQ doorbell-ring-never-received bug that kept MEC1 stuck in the
-    # defNdefN idle-loop pattern through v10.
+    # KCQ doorbell unit invariant — see learnings/doorbell-fields-and-packets-use-different-units.md
+    # for the full three-site table. Summary:
+    #   - MQD CP_HQD_PQ_DOORBELL_CONTROL.DOORBELL_OFFSET field: gets the Linux pre-shifted value `doorbell` (= 6 for idx=0)
+    #   - PACKET3_MAP_QUEUES DW2 doorbell_offset: gets that same pre-shifted value (packet shifts by <<2 internally)
+    #   - host `AMDQueueDesc.doorbell64.view(k * 8, ...)`: needs a SLOT INDEX (= pre-shifted >> 1 = 3 for idx=0)
+    # The host view byte offset is `3 * 8 = 24`, which matches Linux's `WDOORBELL64(6)` -> `cpu_addr + 6` ->
+    # `6 * sizeof(u32) = 24`. Returning the un-shift-right value (`6` instead of `3`) puts the host write at
+    # byte 48, which is a different doorbell slot than MEC is listening to -- the 2026-04-08 v11 bug that
+    # stalled the compute arc for weeks. Do NOT "simplify" this by removing the `>> 1`.
     return doorbell >> 1
 
   def set_clockgating_state(self):

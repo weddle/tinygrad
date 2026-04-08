@@ -34,6 +34,31 @@ The working method on this fork is deliberate and source-driven:
 
 In practice this work has been driven by iterative CLI-agent review and implementation passes, with Linux `amdgpu` behavior used as the arbiter rather than guesswork.
 
+## Workflow Note
+
+For the documented macOS TinyGPU PCI path, routine test runs do **not** need `sudo`.
+
+The correct workflow is:
+
+```bash
+AMD_IFACE=PCI DEV=AMD:LLVM AMD_KIQ_BOOTSTRAP=1 .venv/bin/python3 -c "..."
+```
+
+The repeated `sudo` pattern that appeared during bring-up was a false requirement caused by:
+- older USB BOT helper scripts that really did need root
+- root-owned TinyGPU socket/lock files created by earlier sudo runs
+- root-owned firmware cache blobs under `~/Library/Caches/tinygrad`
+
+If the environment was previously poisoned by sudo runs, the one-time cleanup is:
+
+```bash
+sudo pkill -f "TinyGPU.app.*server"
+sudo rm -f /tmp/am_usb4.lock /tmp/tinygpu.sock
+sudo chown -R "$USER:staff" ~/Library/Caches/tinygrad
+```
+
+After that cleanup, compute runs on this fork work as the normal user.
+
 ## Current Status
 
 Short version: **one tinygrad compute workload has executed end-to-end on this hardware path for the first time.** Specifically:
