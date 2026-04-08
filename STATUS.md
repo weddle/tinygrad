@@ -142,6 +142,16 @@ These are the *verified* positive facts. Anything not on this list is untested.
 
    17 checks total, all pass. First time an attention-shape kernel has been compiled and dispatched on this path; first on-device `Tensor.randn` and `manual_seed`; first multi-axis reductions.
 
+6. **LLM ladder Phase 3 (TinyJit) passes.** `scripts/diag/llm_ladder_phase3_tinyjit.py` exercises tinygrad's `TinyJit` capture-and-replay state machine across six rungs:
+   - `@TinyJit` elementwise × 5 (eager, capture, 3× replay)
+   - `@TinyJit` matmul `16x16 @ 16x16` × 5 (requires `.contiguous()` on `.ones()` inputs — lazy CONSTs are not valid JIT inputs)
+   - `@TinyJit` softmax + reduction × 5 (`softmax(axis=-1).sum(axis=-1)` yields `[1.0, 1.0, 1.0]`)
+   - `@TinyJit` attention kernel `(B=1, H=4, S=8, D=16)` × 5 with cross-call stability check (`sum=21.160675` stable across replays)
+   - Alternating-input cache correctness × 10 (A/B/A/B with different value sets — catches "baked-in captured constants" failure mode)
+   - `Context(JIT=0)` pass-through + `.reset()` + `JIT=default` replay
+
+   41 checks total, all pass. The fused attention kernel (matmul + divide + softmax + matmul) captures and replays correctly under TinyJit on this backend — this is the exact kernel `examples/gpt2.py` uses for every attention layer.
+
 5. **Multi-process re-entry works without a cable replug.** A new Python process immediately after a clean exit of a previous one takes the `partial_boot` path: `AM_GFX.init_hw` calls `reset_mec()` and then re-runs `_setup_kiq()` (with the Step 0 dequeue-if-active check matching Linux `gfx_v10_0.c:7036-7046`) to rebuild per-process KIQ state. Verified for at least 5 consecutive processes in a row across three kernel shapes (arange, matmul, elementwise).
 
 6. **Clean process exit.** `amdev.py::fini()` wraps the SMU `set_clocks(level=0)` call in a `try/except TimeoutError` matching the pre-existing init-path pattern. Process exit is clean; no noisy traceback; GPU stays enumerated to macOS IOKit so the next process can open it.
