@@ -312,22 +312,28 @@ class AM_GFX(AM_IP):
       except Exception as e: print(f"am {self.adev.devfmt}: KIQ setup failed: {e}")
 
   def _setup_kiq(self):
-    """Set up a minimal KIQ on me=1/pipe=2/queue=0 to bootstrap MEC's compute scheduler.
+    """Set up a minimal KIQ by porting Linux gfx_v10_0_kiq_init_register() line-by-line.
 
-    The KIQ is the boot-time control queue that MEC processes unconditionally once
-    RLC_CP_SCHEDULERS.scheduler0 is set with its location and the enable bit. We use it
-    to submit SET_RESOURCES + MAP_QUEUES PM4 packets that enable normal compute queues.
+    Previous implementations used a bulk-register-write pattern over the
+    [CP_MQD_BASE_ADDR .. CP_HQD_PQ_WPTR_HI] range (58 registers) with a KFD-shape
+    activation tail. Investigation 3 (docs/rdna2-setup-kiq-parity-audit.md, 2026-04-08)
+    found 3 CRITICAL + 4 HIGH + 4 MEDIUM + 4 LOW discrepancies with Linux, the biggest
+    being (a) missing EOP buffer allocation — cp_hqd_eop_base=0 and eop_control=0 in the
+    old MQD build, which is the plausible cause of the VA 0x10000 / VA 0 UTCL2
+    instruction-fetch faults decoded in Investigation 2 (docs/rdna2-ih-fault-decode-
+    2026-04-08.md), and (b) the bulk write ordering ignoring Linux's careful "write
+    CP_HQD_ACTIVE last" invariant. This rewrite replaces the bulk pattern with an
+    explicit port of the ~18 WREG32_SOC15 calls in gfx_v10_0.c:7023-7130, in order.
 
-    Without this, MEC's main scheduling loop never starts on the AM driver path because
-    nothing kicks it (KFD's HQD-direct path on Linux relies on amdgpu's KIQ activation
-    having already done that bootstrap).
-
-    KIQ placement: me=1, pipe=2, queue=0 — a separate MEC1 pipe slot from our compute
-    queue at me=1/pipe=0/queue=0. The MEC2-on-me=2 standard placement requires loading
-    mec2.bin via PSP, which broke MEC1 loading on first attempt — reverted for now to
-    bisect the MAP_QUEUES KCQ activation in isolation.
+    KIQ placement: me=2/pipe=0/queue=0 — the standard Sienna Cichlid placement that
+    Linux/amdgpu uses and that the chip's RLC_CP_SCHEDULERS slots are pre-configured
+    for (all 4 scheduler slots point at me=2/pipes 0..3 on cold boot, per
+    docs/rdna2-kcq-vs-kiq-investigation.md). Investigation 1 established that Linux's
+    RDNA2 autoload path does NOT load a separate mec2.bin — MEC1 and MEC2 share the
+    same instruction cache base (CP_CPC_IC_BASE), so the existing MEC1 firmware load
+    should cover MEC2 execution without a separate PSP submission.
     """
-    self.kiq_me, self.kiq_pipe, self.kiq_queue = 1, 2, 0
+    self.kiq_me, self.kiq_pipe, self.kiq_queue = 2, 0, 0
     self.kiq_doorbell_idx = am.AMDGPU_NAVI10_DOORBELL_KIQ
     self.kiq_mqd_mc = self.adev.paddr2mc(self.kiq_mqd_paddr)
     # Allocate the KIQ ring buffer via valloc — gives a GPUVMA address (in mm.va_base range)
@@ -345,6 +351,16 @@ class AM_GFX(AM_IP):
     self.kiq_meta_view = self.adev.pci_dev.map_bar(bar=0, off=_meta_paddr, size=0x1000, fmt='Q')
     self.kiq_rptr_addr = self.kiq_meta_va + 0x00
     self.kiq_wptr_addr = self.kiq_meta_va + 0x08
+    # EOP buffer (2026-04-08 Investigation 3 CRITICAL finding): Linux gfx_v10_0_compute_mqd_init
+    # allocates a real EOP buffer via prop->eop_gpu_addr and writes cp_hqd_eop_base_addr_lo/hi +
+    # cp_hqd_eop_control with EOP_SIZE = order_base_2(GFX10_MEC_HPD_SIZE/4)-1 = 9. The prior
+    # _setup_kiq() left these MQD fields at 0, and the bulk register write then pushed 0 into
+    # CP_HQD_EOP_BASE_ADDR/HI and CP_HQD_EOP_CONTROL. The resulting MEC EOP accesses landed at
+    # VA ~0 and matched the fault addresses decoded from the IH ring (VA 0x10000 READ+EXE,
+    # VA 0 READ). Allocate a real 4 KB EOP buffer (Linux's GFX10_MEC_HPD_SIZE) and thread the
+    # GPU VA into the MQD below.
+    _eop_mapping = self.adev.mm.valloc(0x1000, uncached=True, contiguous=True)
+    self.kiq_eop_va = _eop_mapping.va_addr
     # Cleaner-shader buffer (Linux gfx10_kiq_set_resources writes cleaner_shader_gpu_addr >> 8 in
     # dwords 4 and 5 of SET_RESOURCES). Linux allocates a real BO and copies the gfx10_3_0
     # cleaner shader bytes from drivers/gpu/drm/amd/amdgpu/gfx_v10_0_cleaner_shader.h into it.
@@ -377,41 +393,52 @@ class AM_GFX(AM_IP):
     print(f"am {self.adev.devfmt}: KIQ ring va=0x{self.kiq_ring_va:x} paddr=0x{_ring_paddr:x}; meta va=0x{self.kiq_meta_va:x} paddr=0x{_meta_paddr:x}; cleaner_shader va=0x{self.kiq_cleaner_shader_va:x} paddr=0x{_cleaner_paddr:x} ({len(_cleaner_shader_dws)} dwords loaded)")
     self.kiq_set_resources_sent = False
 
-    # Build the KIQ MQD struct (compute MQD shape, KIQ-specific values)
+    # Build the KIQ MQD struct (compute MQD shape, KIQ-specific values). Fields match Linux
+    # gfx_v10_0_compute_mqd_init() at reference/linux-amdgpu/upstream/drivers/gpu/drm/amd/amdgpu/
+    # gfx_v10_0.c:6907-7021, with tinygrad-invented fields (cp_hqd_hq_status0=0x20004000,
+    # cp_hqd_quantum=0x111) removed per Investigation 3 (docs/rdna2-setup-kiq-parity-audit.md).
     struct_t = getattr(am, f"struct_v{self.adev.ip_ver[am.GC_HWIP][0]}_compute_mqd")
     mqd = struct_t(header=0xC0310800,
       compute_pipelinestat_enable=1, compute_misc_reserved=3,
       cp_mqd_base_addr_lo=lo32(self.kiq_mqd_mc), cp_mqd_base_addr_hi=hi32(self.kiq_mqd_mc),
-      cp_hqd_pipe_priority=2, cp_hqd_queue_priority=0xf, cp_hqd_quantum=0x111,
-      cp_hqd_persistent_state=self.adev.regCP_HQD_PERSISTENT_STATE.encode(preload_size=0x55, preload_req=1),
+      # Linux compute_mqd_init sets cp_hqd_active = prop->hqd_active (= 1 for KIQ) at line 7018.
+      # Tinygrad previously left this default (0) and overrode with an explicit CP_HQD_ACTIVE.write(1)
+      # in the activation tail. Set it in the MQD so the final WREG to CP_HQD_ACTIVE below writes 1.
+      cp_hqd_active=1,
+      # Priority fields from Linux prop->hqd_pipe_priority/hqd_queue_priority. Linux does NOT set
+      # cp_hqd_quantum in compute_mqd_init — tinygrad's old 0x111 was invention, removed here.
+      cp_hqd_pipe_priority=2, cp_hqd_queue_priority=0xf,
+      # Linux gfx_v10_0.c:7006 sets PRELOAD_SIZE=0x53 only. Tinygrad was using 0x55 + preload_req=1
+      # (from KFD's kfd_mqd_manager_v10 path, not amdgpu's KIQ init path). Match Linux.
+      cp_hqd_persistent_state=self.adev.regCP_HQD_PERSISTENT_STATE.encode(preload_size=0x53),
       # GPUVMA addresses (not MC) — fix for first-attempt failure where MC addresses for the ring
       # didn't translate through vmid 0 and MEC silently couldn't fetch from the ring.
       cp_hqd_pq_base_lo=lo32(self.kiq_ring_va >> 8), cp_hqd_pq_base_hi=hi32(self.kiq_ring_va >> 8),
       cp_hqd_pq_rptr_report_addr_lo=lo32(self.kiq_rptr_addr), cp_hqd_pq_rptr_report_addr_hi=hi32(self.kiq_rptr_addr),
       cp_hqd_pq_wptr_poll_addr_lo=lo32(self.kiq_wptr_addr), cp_hqd_pq_wptr_poll_addr_hi=hi32(self.kiq_wptr_addr),
       # Linux gfx_v10_0_compute_mqd_init writes the bare doorbell_index (not shifted) into the
-      # DOORBELL_OFFSET field; REG_SET_FIELD + the register field definition handle the bit
-      # placement. tinygrad's .encode() does the same, so pass the bare index here — the old
-      # `self.kiq_doorbell_idx*2` was a double-shift that happened to be masked on KIQ because
-      # kiq_doorbell_idx=0. On KCQs with nonzero doorbell indices it caused a host↔HQD routing
-      # mismatch (host doorbell BAR write didn't reach the HQD because its DOORBELL_OFFSET
-      # field was double what the host thought).
+      # DOORBELL_OFFSET field; REG_SET_FIELD handles bit placement. Our .encode() does the same.
       cp_hqd_pq_doorbell_control=self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.encode(doorbell_offset=self.kiq_doorbell_idx, doorbell_en=1),
-      # Linux gfx_v10_0_compute_mqd_init sets UNORD_DISPATCH=1 for all compute MQDs (including KIQ
-      # which shares this init path). Previous tinygrad value of 0 left MEC unable to consume
-      # packets from the KIQ ring — HQD active but RPTR stays 0. See investigation log 2026-04-07
-      # "KIQ/KCQ queue-map parity audit" entry.
       # Linux gfx_v10_0_compute_mqd_init sets PRIV_STATE=1 and KMD_QUEUE=1 in CP_HQD_PQ_CONTROL
-      # for ALL compute MQDs (KIQ + KCQ). Without KMD_QUEUE=1 MEC treats the queue as a
-      # user-mode queue and the scheduler refuses to fetch from it (observed empirically: KCQ
-      # ACTIVE=1 but RPTR stays 0). RPTR_BLOCK_SIZE matches Linux's order_base_2(PAGE/4)-1=9.
+      # for ALL compute MQDs (KIQ + KCQ). Without KMD_QUEUE=1 MEC treats the queue as user-mode
+      # and the scheduler refuses to fetch. RPTR_BLOCK_SIZE matches Linux's order_base_2(PAGE/4)-1=9.
       cp_hqd_pq_control=self.adev.regCP_HQD_PQ_CONTROL.encode(rptr_block_size=9, unord_dispatch=1, priv_state=1, kmd_queue=1,
         queue_size=(self.kiq_ring_size//4).bit_length()-2),
       cp_hqd_ib_control=self.adev.regCP_HQD_IB_CONTROL.encode(min_ib_avail_size=0x3),
-      cp_hqd_hq_status0=0x20004000,
-      cp_mqd_control=self.adev.regCP_MQD_CONTROL.encode(priv_state=1),
-      cp_hqd_vmid=0, cp_hqd_aql_control=0)
-    for se in range(8): setattr(mqd, f'compute_static_thread_mgmt_se{se}', 0xffffffff)
+      # Linux gfx_v10_0.c:6963-6965: cp_mqd_control is built by reading the current register and
+      # setting VMID=0. Tinygrad's old encode(priv_state=1) was wrong on two counts: (a) priv_state
+      # in this register is a different field from priv_state in CP_HQD_PQ_CONTROL, and (b) Linux
+      # explicitly sets VMID=0 (not priv_state). Match Linux.
+      cp_mqd_control=self.adev.regCP_MQD_CONTROL.encode(vmid=0),
+      cp_hqd_vmid=0, cp_hqd_aql_control=0,
+      # EOP buffer: Investigation 3's CRITICAL finding. Linux writes eop_base_addr = (eop_gpu_addr
+      # >> 8) and EOP_SIZE = order_base_2(GFX10_MEC_HPD_SIZE/4) - 1 = order_base_2(0x400) - 1 = 9.
+      cp_hqd_eop_base_addr_lo=lo32(self.kiq_eop_va >> 8), cp_hqd_eop_base_addr_hi=hi32(self.kiq_eop_va >> 8),
+      cp_hqd_eop_control=self.adev.regCP_HQD_EOP_CONTROL.encode(eop_size=9))
+    # Sienna Cichlid (gfx10.3) has 4 shader engines, not 8. Upstream PR #9700 (uuuvn, April 2025)
+    # fixed the HQD register-write SE4..SE7 gate from (10,0,0) to (11,0,0) for this reason; we
+    # mirror the same fix in the MQD-build path. Investigation 5 confirmed the upstream precedent.
+    for se in range(4): setattr(mqd, f'compute_static_thread_mgmt_se{se}', 0xffffffff)
     self.adev.vram.view(self.kiq_mqd_paddr, ctypes.sizeof(mqd))[:] = memoryview(mqd).cast('B')
 
     # Set RLC_CP_SCHEDULERS.scheduler0 (bits 0:7) to point at the KIQ.
@@ -422,27 +449,72 @@ class AM_GFX(AM_IP):
     self.adev.regRLC_CP_SCHEDULERS.write(new)
     print(f"am {self.adev.devfmt}: KIQ scheduler0 set: pre=0x{cur:08x} new=0x{new:08x} (me={self.kiq_me} pipe={self.kiq_pipe} queue={self.kiq_queue})")
 
-    # Activate KIQ HQD via direct register writes (same path as compute setup_ring)
+    # Activate KIQ HQD via Linux-faithful explicit register writes. This replaces the old
+    # 58-register bulk-write pattern with ~18 targeted WREG calls in the exact order Linux
+    # uses at gfx_v10_0.c:7023-7130. The key invariants are:
+    #   1. Pre-init disable sequence (WPTR_POLL_CNTL.EN=0, DOORBELL_CONTROL=0) clears prior state
+    #   2. EOP, MQD pointer, PQ base/control all set BEFORE the queue is activated
+    #   3. DOORBELL_CONTROL gets its final value AFTER CP_MEC_DOORBELL_RANGE is programmed
+    #   4. CP_HQD_ACTIVE = 1 is the FINAL write, making the queue go from inactive to active
+    #      in a single atomic transition instead of flickering through partial states
+    #   5. CP_PQ_STATUS.DOORBELL_ENABLE = 1 is the global doorbell enable at the very end
     self._grbm_select(me=self.kiq_me, pipe=self.kiq_pipe, queue=self.kiq_queue, inst=0)
-    mqd_st_mv = to_mv(ctypes.addressof(mqd), ctypes.sizeof(mqd)).cast('I')
-    for i, reg in enumerate(range(self.adev.regCP_MQD_BASE_ADDR.addr[0], self.adev.regCP_HQD_PQ_WPTR_HI.addr[0] + 1)):
-      self.adev.wreg(reg, mqd_st_mv[0x80 + i])
 
-    # KFD-parity activation tail
-    self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.update(doorbell_en=1, doorbell_offset=self.kiq_doorbell_idx)
-    try: self.adev.regCP_PQ_WPTR_POLL_CNTL1.write(1 << (self.kiq_pipe * 8 + self.kiq_queue))
+    # Step 1: Linux 7034 — disable global wptr poll master enable before any HQD writes
+    try: self.adev.regCP_PQ_WPTR_POLL_CNTL.update(en=0)
     except Exception: pass
-    try: self.adev.regCP_HQD_EOP_RPTR.update(init_fetcher=1)
-    except Exception:
-      try: self.adev.regCP_HQD_EOP_RPTR.write(0x80000000)
-      except Exception: pass
-    self.adev.regCP_HQD_ACTIVE.write(0x1)
+
+    # Step 2: Linux 7055 — zero DOORBELL_CONTROL before setting it at step 14
+    self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.write(0)
+
+    # Steps 3-4: Linux 7058-7065 — EOP base + control from MQD
+    self.adev.regCP_HQD_EOP_BASE_ADDR.write(mqd.cp_hqd_eop_base_addr_lo)
+    self.adev.regCP_HQD_EOP_BASE_ADDR_HI.write(mqd.cp_hqd_eop_base_addr_hi)
+    self.adev.regCP_HQD_EOP_CONTROL.write(mqd.cp_hqd_eop_control)
+
+    # Steps 5-7: Linux 7068-7075 — MQD pointer + control
+    self.adev.regCP_MQD_BASE_ADDR.write(mqd.cp_mqd_base_addr_lo)
+    self.adev.regCP_MQD_BASE_ADDR_HI.write(mqd.cp_mqd_base_addr_hi)
+    self.adev.regCP_MQD_CONTROL.write(mqd.cp_mqd_control)
+
+    # Steps 8-9: Linux 7078-7085 — PQ base + control
+    self.adev.regCP_HQD_PQ_BASE.write(mqd.cp_hqd_pq_base_lo)
+    self.adev.regCP_HQD_PQ_BASE_HI.write(mqd.cp_hqd_pq_base_hi)
+    self.adev.regCP_HQD_PQ_CONTROL.write(mqd.cp_hqd_pq_control)
+
+    # Steps 10-11: Linux 7088-7097 — rptr/wptr writeback addresses
+    self.adev.regCP_HQD_PQ_RPTR_REPORT_ADDR.write(mqd.cp_hqd_pq_rptr_report_addr_lo)
+    self.adev.regCP_HQD_PQ_RPTR_REPORT_ADDR_HI.write(mqd.cp_hqd_pq_rptr_report_addr_hi)
+    self.adev.regCP_HQD_PQ_WPTR_POLL_ADDR.write(mqd.cp_hqd_pq_wptr_poll_addr_lo)
+    self.adev.regCP_HQD_PQ_WPTR_POLL_ADDR_HI.write(mqd.cp_hqd_pq_wptr_poll_addr_hi)
+
+    # Step 12: Linux 7101-7104 — doorbell aperture range for the KIQ
+    # Linux computes (kiq_idx * 2) << 2 for lower and (userqueue_end * 2) << 2 for upper.
+    # On navi10, kiq_doorbell_idx=0 so lower=0. userqueue_end=0x8a so upper=(0x8a*2)<<2=0x450.
+    self.adev.regCP_MEC_DOORBELL_RANGE_LOWER.write((self.kiq_doorbell_idx * 2) << 2)
+    self.adev.regCP_MEC_DOORBELL_RANGE_UPPER.write((0x8a * 2) << 2)
+
+    # Step 13: Linux 7107 — write final DOORBELL_CONTROL from MQD (enable bit on now)
+    self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.write(mqd.cp_hqd_pq_doorbell_control)
+
+    # Steps 14-15: Linux 7111-7114 — reset wptr to 0 (MQD value is 0 since we didn't set it)
+    self.adev.regCP_HQD_PQ_WPTR_LO.write(0)
+    self.adev.regCP_HQD_PQ_WPTR_HI.write(0)
+
+    # Steps 16-17: Linux 7117-7120 — VMID + persistent state from MQD
+    self.adev.regCP_HQD_VMID.write(mqd.cp_hqd_vmid)
+    self.adev.regCP_HQD_PERSISTENT_STATE.write(mqd.cp_hqd_persistent_state)
+
+    # Step 18: Linux 7123 — FINAL write, activate the queue
+    self.adev.regCP_HQD_ACTIVE.write(mqd.cp_hqd_active)
+
+    # Step 19: Linux 7127 — global doorbell enable in CP_PQ_STATUS
     try: self.adev.regCP_PQ_STATUS.update(doorbell_enable=1)
     except Exception: pass
-    self.adev.gmc.flush_hdp()
+
     self._grbm_select(inst=0)
     self.kiq_setup_done = True
-    print(f"am {self.adev.devfmt}: KIQ HQD activated (ring va=0x{self.kiq_ring_va:x}, mqd mc=0x{self.kiq_mqd_mc:x}, doorbell idx {self.kiq_doorbell_idx})")
+    print(f"am {self.adev.devfmt}: KIQ HQD activated via Linux-shaped register sequence (me={self.kiq_me}/pipe={self.kiq_pipe}/queue={self.kiq_queue}, ring va=0x{self.kiq_ring_va:x}, mqd mc=0x{self.kiq_mqd_mc:x}, eop va=0x{self.kiq_eop_va:x}, doorbell idx {self.kiq_doorbell_idx})")
     # NOTE: do NOT submit SET_RESOURCES here. Linux amdgpu_gfx_enable_kcq() batches
     # SET_RESOURCES + MAP_QUEUES into a single KIQ commit with one doorbell ring so MEC sees
     # both packets at once. Submitting SET_RESOURCES alone (followed by a sleep and separate
@@ -611,36 +683,42 @@ class AM_GFX(AM_IP):
       # and KFD's init_mqd both set these on every compute MQD. tinygrad was leaving them at 0,
       # which may be why MEC's pipeline-stat / scheduling logic ignores the queue. Adding to match
       # upstream parity.
+      # KCQ MQD build: mirror Linux gfx_v10_0_compute_mqd_init() at gfx_v10_0.c:6907-7021.
+      # Per Investigation 3 (docs/rdna2-setup-kiq-parity-audit.md): remove tinygrad-invented
+      # cp_hqd_hq_status0=0x20004000 and cp_hqd_quantum=0x111 (Linux sets neither), change
+      # cp_mqd_control.priv_state=1 to cp_mqd_control.vmid=0 (wrong field), fix persistent_state
+      # to Linux's preload_size=0x53 (without preload_req).
       mqd_struct = struct_t(header=0xC0310800,
         compute_pipelinestat_enable=0x00000001, compute_misc_reserved=0x00000003,
         cp_mqd_base_addr_lo=lo32(self.mqd_mc[queue] + 0x1000*xcc),
-        cp_mqd_base_addr_hi=hi32(self.mqd_mc[queue] + 0x1000*xcc), cp_hqd_pipe_priority=0x2, cp_hqd_queue_priority=0xf, cp_hqd_quantum=0x111,
-        # preload_req=1 matches KFD's kfd_mqd_manager_v10.c::init_mqd line 108:
-        # m->cp_hqd_persistent_state = PRELOAD_REQ_MASK | 0x53 << PRELOAD_SIZE_SHIFT
-        # We had bisected this to 0 earlier suspecting CSA dereference faults; the actual fix is
-        # CP_PQ_WPTR_POLL_CNTL1 + CP_HQD_EOP_RPTR.INIT_FETCHER (see end of this method).
-        cp_hqd_persistent_state=self.adev.regCP_HQD_PERSISTENT_STATE.encode(preload_size=0x55, preload_req=1),
+        cp_mqd_base_addr_hi=hi32(self.mqd_mc[queue] + 0x1000*xcc),
+        cp_hqd_pipe_priority=0x2, cp_hqd_queue_priority=0xf,
+        # Linux gfx_v10_0.c:7006: PRELOAD_SIZE=0x53 only. Dropped tinygrad's preload_req=1.
+        cp_hqd_persistent_state=self.adev.regCP_HQD_PERSISTENT_STATE.encode(preload_size=0x53),
         cp_hqd_pq_base_lo=lo32(ring_addr>>8), cp_hqd_pq_base_hi=hi32(ring_addr>>8),
         cp_hqd_pq_rptr_report_addr_lo=lo32(rptr_addr), cp_hqd_pq_rptr_report_addr_hi=hi32(rptr_addr),
         cp_hqd_pq_wptr_poll_addr_lo=lo32(wptr_addr), cp_hqd_pq_wptr_poll_addr_hi=hi32(wptr_addr),
-        # On gfx10 compute rings Linux stores the already-normalized
-        # ring->doorbell_index = (mec_ring0 + ring_id) << 1 in the MQD doorbell
-        # field. Keep KIQ's raw convention separate; this path is KCQ-only.
+        # Linux gfx_v10_0_kcq_init_queue() pre-normalizes compute-ring doorbells as
+        # (mec_ring0 + ring_id) << 1 and reuses that same ring->doorbell_index across MQD,
+        # MAP_QUEUES packet, and host WDOORBELL64 path.
         cp_hqd_pq_doorbell_control=self.adev.regCP_HQD_PQ_DOORBELL_CONTROL.encode(doorbell_offset=doorbell, doorbell_en=1),
-        # Linux gfx_v10_0_compute_mqd_init unconditionally sets PRIV_STATE=1 and KMD_QUEUE=1 for
-        # all compute MQDs (KIQ and KCQ). Without KMD_QUEUE=1 MEC's compute scheduler treats the
-        # queue as user-mode and refuses to fetch from it (observed empirically: MAP_QUEUES sets
-        # ACTIVE=1 but KCQ rptr stays 0 forever). KIQ "works" without these flags because it
-        # goes through a separate code path tied to RLC_CP_SCHEDULERS.scheduler0, not the normal
-        # compute scheduler. RPTR_BLOCK_SIZE=9 matches Linux's order_base_2(PAGE/4)-1.
+        # Linux compute_mqd_init sets PRIV_STATE=1 + KMD_QUEUE=1 in CP_HQD_PQ_CONTROL for all
+        # compute MQDs. RPTR_BLOCK_SIZE matches Linux's order_base_2(PAGE/4)-1=9.
         cp_hqd_pq_control=self.adev.regCP_HQD_PQ_CONTROL.encode(rptr_block_size=9, unord_dispatch=1, priv_state=1, kmd_queue=1, queue_size=(ring_size//4).bit_length()-2,
           **({'queue_full_en':1, 'slot_based_wptr':2, 'no_update_rptr':xcc!=0 or self.xccs==1} if aql else {})),
-        cp_hqd_ib_control=self.adev.regCP_HQD_IB_CONTROL.encode(min_ib_avail_size=0x3), cp_hqd_hq_status0=0x20004000,
-        cp_mqd_control=self.adev.regCP_MQD_CONTROL.encode(priv_state=1), cp_hqd_vmid=0, cp_hqd_aql_control=int(aql),
+        cp_hqd_ib_control=self.adev.regCP_HQD_IB_CONTROL.encode(min_ib_avail_size=0x3),
+        # Linux gfx_v10_0.c:6963-6965: cp_mqd_control is built by setting VMID=0 (the RMW target
+        # field). Tinygrad previously used .encode(priv_state=1) which is the wrong field — the
+        # priv_state bit in CP_MQD_CONTROL is distinct from the priv_state bit in CP_HQD_PQ_CONTROL.
+        cp_mqd_control=self.adev.regCP_MQD_CONTROL.encode(vmid=0),
+        cp_hqd_vmid=0, cp_hqd_aql_control=int(aql),
         cp_hqd_eop_base_addr_lo=lo32(eop_addr>>8), cp_hqd_eop_base_addr_hi=hi32(eop_addr>>8),
         cp_hqd_eop_control=self.adev.regCP_HQD_EOP_CONTROL.encode(eop_size=(eop_size//4).bit_length()-2),
         **({'compute_tg_chunk_size':1, 'compute_current_logic_xcc_id':xcc, 'cp_mqd_stride_size':0x1000} if aql and self.xccs > 1 else {}))
-      for se in range(8 if self.adev.ip_ver[am.GC_HWIP][0] >= 10 else 4): setattr(mqd_struct, f'compute_static_thread_mgmt_se{se}', 0xffffffff)
+      # Sienna Cichlid (gfx10.3) has 4 SEs. Upstream PR #9700 fixed the HQD register SE4..SE7
+      # gate from (10,0,0) to (11,0,0); mirror the same fix in this MQD-build path.
+      _num_se = 4 if (10,0,0) <= self.adev.ip_ver[am.GC_HWIP] < (11,0,0) else (8 if self.adev.ip_ver[am.GC_HWIP][0] >= 10 else 4)
+      for se in range(_num_se): setattr(mqd_struct, f'compute_static_thread_mgmt_se{se}', 0xffffffff)
 
       self.adev.vram.view(self.mqd_paddr[queue] + 0x1000*xcc, ctypes.sizeof(mqd_struct))[:] = memoryview(mqd_struct).cast('B')
 
@@ -676,17 +754,11 @@ class AM_GFX(AM_IP):
         # let MEC firmware load it via MAP_QUEUES PM4 packet through the KIQ ring (issued
         # below, after this loop).
         #
-        # Set the per-queue WPTR_POLL enable bit in CP_PQ_WPTR_POLL_CNTL1. Empirically on
-        # RDNA2 (RX 6900 XT) MEC activates the queue via MAP_QUEUES (ACTIVE=1) but does NOT
-        # poll the host wptr_gpu_addr until this bit is set for the target (pipe, queue).
-        # The bit layout is `1 << (pipe * 8 + queue)`. The KFD direct-HQD fallback path above
-        # already does this write; Linux's amdgpu MAP_QUEUES path appears to rely on MEC to
-        # enable polling internally, but MEC isn't doing so on this hardware / firmware combo.
-        # Pulling the write out of the fallback gate is a single-variable test; if this is the
-        # missing ingredient, the compute queue rptr will start advancing.
-        _queue_mask = 1 << (pipe * 8 + queue)
-        try: self.adev.regCP_PQ_WPTR_POLL_CNTL1.write(_queue_mask, inst=xcc)
-        except Exception as e: print(f"am {self.adev.devfmt}: CP_PQ_WPTR_POLL_CNTL1 write failed: {e}")
+        # NOTE: removed the CP_PQ_WPTR_POLL_CNTL1 per-queue bit write here. Investigation 1
+        # (docs/rdna2-mec2-firmware-audit-2026-04-08.md) confirmed this is a KFD-path-only
+        # semantic that Linux's amdgpu MAP_QUEUES path does not use. The bit also empirically
+        # got cleared by something between our write and the actual submission (possibly
+        # MEC's MAP_QUEUES handler), so it was never effective anyway.
         print(f"am {self.adev.devfmt}: KCQ MQD built; activation deferred to KIQ MAP_QUEUES")
 
       self.adev.gmc.flush_hdp()
