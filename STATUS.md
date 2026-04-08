@@ -117,25 +117,40 @@ These are the *verified* positive facts. Anything not on this list is untested.
 
 1. **`AMDDevice()` initialization works on this hardware path.** PSP, SMU, GFX, and SDMA all come up and the subsequent runtime test can submit to both SDMA and the compute queue.
 
-2. **SDMA ring submission works.** The Linux-shaped SDMA ring smoke test retires correctly.
+2. **SDMA ring submission works.** The Linux-shaped SDMA ring smoke test retires correctly, and every compute readback (`copyout`) rides the SDMA path.
 
-3. **A single `Tensor.arange(16, device='AMD').realize()` kernel executes and returns the correct values.** End-to-end: KIQ comes up, KCQ gets mapped via SET_RESOURCES + MAP_QUEUES through the KIQ, the host publishes PM4, MEC1 fetches, the kernel runs, the result is written back, and the host copyout returns `[0..15]`. This is the only compute workload that has been verified to work on this path.
+3. **Compute dispatch works on the KCQ via KIQ-mediated MAP_QUEUES.** End-to-end: KIQ comes up (Linux-faithful `_setup_kiq` on `me=2/pipe=0/queue=0`), KCQ gets mapped via batched SET_RESOURCES + MAP_QUEUES through the KIQ, the host publishes PM4, MEC1 fetches, the kernel runs, the result is written back via SDMA, and the host copyout returns correct values.
+
+4. **LLM ladder Phase 1 (compute stability) passes.** The ladder script at `scripts/diag/llm_ladder_phase1_compute.py` (in the companion `tiny-egpu` repo) runs unprivileged end-to-end and passes every step:
+   - `Tensor.arange(16).realize()` — single dispatch
+   - `arange(16)` twice in one process — multi-dispatch in one session
+   - `ones(16) + ones(16)` — elementwise add
+   - `(arange(16) * 2) + 3` — chained elementwise
+   - `ones(4,4) @ ones(4,4)` — small matmul
+   - `arange(256).sum() == 32640` — reduction + larger shape
+   - Matmul sweep `16x16`, `64x64`, `128x128` — all return correct values, all dispatch-latency-bound at ~25ms (not compute-bound)
+
+5. **Multi-process re-entry works without a cable replug.** A new Python process immediately after a clean exit of a previous one takes the `partial_boot` path: `AM_GFX.init_hw` calls `reset_mec()` and then re-runs `_setup_kiq()` (with the Step 0 dequeue-if-active check matching Linux `gfx_v10_0.c:7036-7046`) to rebuild per-process KIQ state. Verified for at least 5 consecutive processes in a row across three kernel shapes (arange, matmul, elementwise).
+
+6. **Clean process exit.** `amdev.py::fini()` wraps the SMU `set_clocks(level=0)` call in a `try/except TimeoutError` matching the pre-existing init-path pattern. Process exit is clean; no noisy traceback; GPU stays enumerated to macOS IOKit so the next process can open it.
+
+7. **Unprivileged TinyGPU PCI workflow.** `AMD_IFACE=PCI DEV=AMD:LLVM AMD_KIQ_BOOTSTRAP=1 .venv/bin/python3 ...` runs as a normal user — no `sudo` — through the TinyGPU.app + dext flow. See the Workflow Note section above for the one-time cleanup if stale root-owned state from an earlier `sudo` run needs clearing.
 
 ## What Is Not Yet Verified
 
 These things have **not** been tested on this fork yet, and should not be assumed to work:
 
-- Multiple dispatches in a single session (only a single-dispatch run has been verified)
-- Tensors other than a 16-element `arange` (no other shapes tested)
-- Non-trivial ops (`matmul`, `conv`, `softmax`, `sum`, etc.) — untested
-- `TinyJit`, graph execution, or any training-shaped workload — untested
-- Stability under repeated runs — every prior hardware run on this path has required a power cycle after wedging, and we do not yet know whether the post-v11 path is wedge-free
-- Multi-tensor memory allocations beyond the small buffers the arange test touches
-- Any performance claim at all
+- **LLM ladder Phases 2 through 6** — primitive coverage (softmax/layernorm/gelu/silu/embedding/reductions/attention-shape), TinyJit, tiny transformer forward, tinygrad's `examples/transformer.py` / `examples/gpt2.py`, and the first controlled GPT-2 small inference. These are the planned next rungs of the ladder.
+- Matmul sizes beyond `128x128` — dispatch cost dominates at the sizes tested, so no compute-throughput claim has been measured
+- Convolution (`conv2d`, etc.) — not exercised
+- Training-shaped workloads (autograd, optimizer step, `backward()`) — not exercised
+- Larger tensor allocations and multi-tensor memory pressure beyond what Phase 1 touches
+- Any performance claim at all (no benchmarking)
+- `mode1_reset` on Sienna Cichlid — still known-broken on this ASIC, but no longer a practical blocker because `partial_boot` re-entry handles warm re-open
 
 ## What Is Not Working
 
-- **Device `fini`/shutdown path.** `SMU msg 0x1f timeout` fires at `atexit` finalize. This is the pre-existing `PPSMC_MSG_GetDpmFreqByIndex` issue (separate tracking item) and happens *after* the compute result has already returned to the user, but it is still a real bug and noise in the log.
+- **Larger compute workloads are untested.** Not a known-broken case — just unverified. Moving up the LLM ladder will surface any size-scaling or op-coverage bugs as they appear.
 
 ## What We Have Tried And Mostly Ruled Out
 
